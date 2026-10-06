@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "worldline-video-model"
+version = "0.1.0"
+description = "Persistent-state video world model over frozen video-encoder latents"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["world model", "video", "JEPA", "latent dynamics", "state-space"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+# optional: the pretrained V-JEPA 2 encoder plus the sample-dataset download helpers
+vjepa = ["transformers>=5.15,<6", "huggingface_hub>=0.23"]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+wpm-video = "wpm_video.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+wpm_video = ["py.typed"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["*.pyc", "__pycache__/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

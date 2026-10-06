@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Model weights, cached latents and run outputs stay out of the repository
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+cache/
+runs/
+videos/
+data/
+!examples/data/**
+
+# Local environment and secrets
+.env
+.env.*
