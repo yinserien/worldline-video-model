@@ -1,0 +1,61 @@
+{
+  "name": "native_tiny",
+  "data": {
+    "video_dir": "videos",
+    "cache_dir": "cache/native",
+    "fps": 4.0,
+    "chunk_frames": 8,
+    "chunk_stride_frames": 8,
+    "image_size": 64,
+    "context_chunks": 3,
+    "window_stride_chunks": 1,
+    "horizon_chunks": [
+      1,
+      2
+    ],
+    "train_videos": [],
+    "val_videos": [],
+    "max_horizon_chunks": 4
+  },
+  "encoder": {
+    "kind": "native",
+    "model_id": "native",
+    "revision": "native",
+    "allow_native_fallback": true,
+    "device": "cpu",
+    "batch_clips": 4
+  },
+  "model": {
+    "d_world": 32,
+    "d_hidden": 64,
+    "slots": 16,
+    "heads": 4,
+    "projection_seed": 1,
+    "a_max": 1.0,
+    "damping_init": 0.5,
+    "substep_seconds": 0.25,
+    "max_substeps": 256,
+    "logvar_min": -8.0,
+    "logvar_max": 6.0,
+    "anchor_bandwidth": 1.0,
+    "velocity_write": 0.5,
+    "kl_beta": 0.01,
+    "w_horizon": 1.0,
+    "w_prior": 0.5,
+    "w_present": 0.5
+  },
+  "train": {
+    "seed": 0,
+    "batch_windows": 4,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0,
+    "max_steps": 300,
+    "grad_clip_norm": 5.0,
+    "eval_interval": 50,
+    "eval_batches": 2,
+    "max_wall_seconds": 600.0,
+    "device": "cpu",
+    "resume_from": "",
+    "log_interval": 25
+  }
+}

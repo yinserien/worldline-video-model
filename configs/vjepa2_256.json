@@ -1,0 +1,61 @@
+{
+  "name": "vjepa2_256",
+  "data": {
+    "video_dir": "videos",
+    "cache_dir": "cache/tokens",
+    "fps": 4.0,
+    "chunk_frames": 8,
+    "chunk_stride_frames": 8,
+    "image_size": 256,
+    "context_chunks": 3,
+    "window_stride_chunks": 1,
+    "horizon_chunks": [
+      1,
+      2
+    ],
+    "train_videos": [],
+    "val_videos": [],
+    "max_horizon_chunks": 4
+  },
+  "encoder": {
+    "kind": "vjepa2",
+    "model_id": "facebook/vjepa2-vitl-fpc64-256",
+    "revision": "b3c1679b7c34d3255ef3547f27c7b226aefab26f",
+    "allow_native_fallback": false,
+    "device": "cuda",
+    "batch_clips": 4
+  },
+  "model": {
+    "d_world": 256,
+    "d_hidden": 512,
+    "slots": 64,
+    "heads": 4,
+    "projection_seed": 20261006,
+    "a_max": 1.0,
+    "damping_init": 0.5,
+    "substep_seconds": 0.25,
+    "logvar_min": -8.0,
+    "logvar_max": 6.0,
+    "kl_beta": 0.01,
+    "velocity_write": 0.5,
+    "anchor_bandwidth": 2.0,
+    "max_substeps": 256,
+    "w_horizon": 1.0,
+    "w_prior": 0.5,
+    "w_present": 0.5
+  },
+  "train": {
+    "seed": 0,
+    "batch_windows": 8,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0,
+    "max_steps": 3000,
+    "grad_clip_norm": 5.0,
+    "eval_interval": 250,
+    "eval_batches": 8,
+    "max_wall_seconds": 1800.0,
+    "device": "cuda",
+    "resume_from": "",
+    "log_interval": 25
+  }
+}
