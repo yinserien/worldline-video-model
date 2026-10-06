@@ -20,7 +20,7 @@
 # 1) 包外环境（可复用已有的 torch，避免重复下载）
 python -m venv --system-site-packages E:\work\wpm_env
 # 2) 安装发行包
-& "E:\work\wpm_env\Scripts\python.exe" -m pip install "E:\path\to\worldline_video_model-0.2.0-py3-none-any.whl"
+& "E:\work\wpm_env\Scripts\python.exe" -m pip install "E:\path\to\worldline_video_model-0.3.0-py3-none-any.whl"
 # 3) 校验（用解释器全路径，不依赖 PATH）
 & "E:\work\wpm_env\Scripts\python.exe" -m wpm_video --version
 ```
@@ -29,7 +29,7 @@ Linux / macOS：
 
 ```bash
 python -m venv --system-site-packages ~/wpm_env
-~/wpm_env/bin/python -m pip install "/path/to/worldline_video_model-0.2.0-py3-none-any.whl"
+~/wpm_env/bin/python -m pip install "/path/to/worldline_video_model-0.3.0-py3-none-any.whl"
 ~/wpm_env/bin/python -m wpm_video --version
 ```
 
@@ -37,7 +37,7 @@ python -m venv --system-site-packages ~/wpm_env
   （构建过程中源码目录里会出现构建中间产物）。
 - 只用 native 编码器（合成视频、CPU）时，上面的安装就够了。
 - 需要真实 V-JEPA 2 编码器时，再安装可选依赖：安装 wheel 时写成
-  `"E:\path\to\worldline_video_model-0.2.0-py3-none-any.whl[vjepa]"`，或单独执行
+  `"E:\path\to\worldline_video_model-0.3.0-py3-none-any.whl[vjepa]"`，或单独执行
   `pip install "transformers>=5.15,<6" huggingface_hub`。
 - 本页后续命令统一写作 `& $py -m wpm_video`，其中 `$py` 是解释器全路径
   （`&` 是 PowerShell 调用运算符，省略它无法执行变量里的命令）。激活环境后也可以用
@@ -64,8 +64,10 @@ $py = "E:\work\wpm_env\Scripts\python.exe"
 ```
 
 生成的 `config.json` 使用默认值（`data.video_dir` = `videos`，`cache_dir` =
-`cache/tokens`，设备 `cuda`）。把它改成你的实际输入位置和采样参数后再往下走；字段
-说明、默认值与约束见 [docs/configuration.md](docs/configuration.md)。
+`cache/tokens`，设备 `cuda`，`performance` 段全部为参考实现：FP32、reference 注意力、
+不用 fused 优化器、不编译、不固定内存）。把它改成你的实际输入位置和采样参数后再往下
+走；字段说明、默认值与约束见 [docs/configuration.md](docs/configuration.md)，可选加速项
+见 [docs/performance.md](docs/performance.md)。
 
 ## 无下载的 CPU 示例
 
@@ -83,6 +85,11 @@ $py = "E:\work\wpm_env\Scripts\python.exe"
 留出视频上的 `l1`/`mse`/`psnr`，并写出 `decoded_h1.png`（预测 latent 解码）与
 `target_reconstruction_h1.png`（真值 latent 解码）等关键帧。脚本只在 `--out` 与一个
 临时目录里写文件，不会在包目录内生成任何东西。
+
+同一目录还提供 `examples/benchmark.py`：用**合成** tensor 与图像测世界模型/解码器的
+单步训练耗时（不含预训练编码器、视频 IO、评估与 checkpoint 时间），产物是 JSON 与可选
+profiler trace，全部写到 `--out` 指定的包外目录。接口与读法见
+[docs/performance.md](docs/performance.md)。
 
 ## 用自己的视频
 
@@ -155,6 +162,47 @@ $py = "E:\work\wpm_env\Scripts\python.exe"
 `predict` 只需要 checkpoint、编码器配置和视频，可以搬到没有训练数据的机器上运行；
 `query` 连视频和编码器都不需要。各命令参数与产物见 [docs/commands.md](docs/commands.md)。
 
+## 性能选项（可选）
+
+默认全部是参考实现：FP32、reference 注意力、普通 AdamW、不编译、不固定内存。想要更快时在
+配置里显式打开，收益取决于设备/torch/batch，包不做任何速度保证；打开后数值契约不变：
+
+```json
+"performance": {
+  "precision": "bfloat16",
+  "anchor_attention": "sdpa",
+  "fused_optimizer": true,
+  "compile": false,
+  "pin_memory": true,
+  "non_blocking": true
+}
+```
+
+- `precision`：`bfloat16` 只作用于模型**计算**；持久状态仍 FP32、时钟仍 float64，NLL/KL、
+  投影标准化与所有上报指标都在 FP32 计算，验证固定用 FP32 以便跨精度比较。
+- `anchor_attention`：`sdpa` 用融合核（不返回注意力权重）；`predict` 的公开默认仍会返回
+  真实权重，训练/验证/推理内部路径才使用配置的核。
+- `fused_optimizer`：仅 CUDA；在 CPU 上请求会直接报错，不会静默退回。
+- `compile`：只编译 predictor head，是否可用取决于 torch 版本/后端/平台；会先做一次真实
+  执行的预检，失败抛 `PerformanceError`。不依赖自定义 CUDA/Triton 算子。
+- `pin_memory`/`non_blocking`：仅 CUDA 生效的传输选项，数值与不开启时完全一致。
+
+编码与解码器的数据路径同样可选加速：`encoder.batch_clips` 现在是**真实 batch**（native
+一次 `conv3d`，V-JEPA2 一次模型调用）；`decoder_train.target_cache_dir` 可缓存目标关键帧，
+命中时不再解码视频（但仍校验源文件哈希）。检查点记录实际生效的策略，续训拒绝精度/注意力
+核/fused/compile 的语义变化，忽略设备与 pinned 等元数据差异。
+
+合成单步基准由 `examples/benchmark.py` 提供（结果只写到包外目录）：
+
+```powershell
+& $py "E:\path\to\sdist\examples\benchmark.py" --out E:\work\wpm_run\bench --device cuda
+```
+
+它测的是世界模型/解码器单步训练（forward+backward+clip+AdamW）的稳态耗时，**不含**预训练
+编码器、视频 IO、缓存构建、评估与 checkpoint；编码器/缓存的批处理收益请单独计时，不要把
+不同用例的数字相加。完整边界、读数注意事项与编码器/缓存基准方法见
+[docs/performance.md](docs/performance.md)。
+
 ## Python API
 
 ```python
@@ -202,16 +250,17 @@ images = decode_latents(decoder, {2.0: futures[2.0]["mu"]}, device)   # {2.0: (3
 - [docs/commands.md](docs/commands.md)：CLI 命令、参数与输出文件
 - [docs/api.md](docs/api.md)：Python API 与张量形状、单位
 - [docs/decoder.md](docs/decoder.md)：可选 RGB 解码器的架构、训练、兼容性与已知限制
+- [docs/performance.md](docs/performance.md)：可选加速项、精度契约与基准测试方法
 - [examples/prepare_sample_dataset.md](examples/prepare_sample_dataset.md)：公开样例片段下载与来源校验
 
 ## 目录
 
 ```
 src/wpm_video/   包源码（config data dataset encoder model world_state train evaluate
-                 predict viz selfcheck cli __main__）
+                 predict viz performance selfcheck cli __main__）
 src/wpm_video/decoder/  可选 RGB 解码器（model compat targets train render）
 configs/         vjepa2_256.json（真实编码器）、native_tiny.json（CPU，无下载）
-examples/        无下载全链路示例、公开样例数据准备
-tests/           架构契约、端到端流水线、CLI 与来源校验、解码器
+examples/        无下载全链路示例、公开样例数据准备、合成基准脚本
+tests/           架构契约、端到端流水线、CLI 与来源校验、解码器、性能选项
 docs/            使用文档
 ```

@@ -27,6 +27,8 @@ from torch import nn
 from .config import RunConfig
 from .dataset import TokenDataset, WindowSampler, check_split_integrity, gather_batch
 from .model import VideoWorldModel, gaussian_kl_bits, gaussian_nll_bits
+from .performance import (apply_compile, autocast_context, build_optimizer, optimizer_policy,
+                          precision_policy, require_matching_policy, training_policy)
 from .world_state import WorldState
 
 
@@ -69,7 +71,8 @@ def rng_restore(snapshot: dict) -> None:
 
 
 def build_model(config: RunConfig, encoder, device) -> VideoWorldModel:
-    model = VideoWorldModel(config.model, encoder.d_model, encoder.patches, config.data.chunk_seconds)
+    model = VideoWorldModel(config.model, encoder.d_model, encoder.patches, config.data.chunk_seconds,
+                            anchor_attention=config.performance.anchor_attention)
     return model.to(device)
 
 
@@ -91,39 +94,103 @@ def fit_projection(model: VideoWorldModel, dataset: TokenDataset, max_tokens: in
 def stream_observed(model: VideoWorldModel, batch: dict, sample: bool, generator=None):
     """Observe every context chunk in order; returns the per-chunk states and diagnostics."""
     observed = batch["observed"]
+    substeps = batch.get("context_substeps")
     state = model.initial_state(observed.shape[0], observed.device, observed.dtype)
     states, diagnostics = [], []
     for index in range(observed.shape[1]):
-        state, record = model.observe(
-            state, observed[:, index], batch["end_seconds"][:, index], sample=sample, generator=generator
-        )
+        if substeps is None:
+            # no host-validated plan for this batch: take the fully validated path
+            state, record = model.observe(state, observed[:, index], batch["end_seconds"][:, index],
+                                          sample=sample, generator=generator)
+        else:
+            state, record = model._observe_planned(
+                state, observed[:, index], batch["end_seconds"][:, index], substeps[index],
+                sample=sample, generator=generator
+            )
         states.append(state)
         diagnostics.append(record)
     return states, diagnostics
 
 
+def predict_for_horizon(model, state, entry, index, reference_mu=None, want_attention=False):
+    """Predict one (anchor, horizon) slice, using the host-validated plan when present.
+
+    ``gather_batch`` precomputes the valid rows and the integrator step count on CPU
+    (with the model's own formula), so the training loop can call the private planned
+    path; anything else -- a batch assembled by a caller that did not pass a model
+    config -- falls back to the fully validated public ``predict``.
+    """
+    substeps = entry.get("substeps") if hasattr(entry, "get") else None
+    deltas = entry["delta_seconds"][index]
+    if substeps is None:
+        return model.predict(state, deltas, reference_mu=reference_mu,
+                             want_attention=want_attention)
+    return model._predict_planned(state, deltas, substeps, reference_mu=reference_mu,
+                                  want_attention=want_attention)
+
+
+def materialize_stats(stats: dict) -> dict:
+    """Convert collected tensor statistics into the public float view."""
+    return {key: (float(value) if torch.is_tensor(value) else value)
+            for key, value in stats.items()}
+
+
 def forward_window(model: VideoWorldModel, batch: dict, config: RunConfig, sample: bool = True,
-                   generator=None):
-    """Stream the observed context and score the multi-horizon objective."""
+                   generator=None, stats_mode: str = "float"):
+    """Stream the observed context and score the multi-horizon objective.
+
+    ``stats_mode`` selects how the returned statistics are represented:
+
+    - ``"float"`` (default, the public contract) returns plain Python floats;
+    - ``"tensor"`` returns detached tensors, so a training loop can accumulate a step
+      without a GPU->Python synchronisation per horizon and materialise the numbers
+      only on log/evaluation steps. The values are identical; only the moment they
+      leave the device changes.
+
+    The present estimate of one observed state is computed once per anchor and shared
+    by every horizon that anchors on it (rows never mix, and the shared tensor stays
+    in the graph, so gradients still accumulate from each horizon). Horizons are
+    still advanced independently: their per-batch maximum delta decides the Euler
+    step size, so one horizon is never advanced from another's state.
+    """
+    if stats_mode not in ("float", "tensor"):
+        raise ValueError(f"stats_mode must be 'float' or 'tensor', got {stats_mode!r}")
     states, diagnostics = stream_observed(model, batch, sample, generator)
     model_cfg = config.model
-    horizon_sum, horizon_items, squared_sum = None, 0, 0.0
+    estimates = {}
+
+    def estimate_for(offset: int):
+        """Present estimate of one observed state, computed once and shared."""
+        if offset not in estimates:
+            estimates[offset] = model.present_estimate(states[offset])
+        return estimates[offset]
+
+    horizon_sum, horizon_items, squared_sum = None, 0, None
     per_horizon = {}
     for (offset, horizon), entry in batch["targets"].items():
-        valid = entry["valid"]
-        index = valid.nonzero().flatten()
+        index = entry.get("index")
+        if index is None:
+            index = entry["valid"].nonzero().flatten()
         if index.numel() == 0:
             continue
-        mu, logvar, _, _ = model.predict(states[offset][index], entry["delta_seconds"][index])
+        reference = estimate_for(offset)[0][index]
+        # training does not consume attention weights: ask for the configured kernel
+        mu, logvar, _, _ = predict_for_horizon(model, states[offset][index], entry, index,
+                                               reference_mu=reference, want_attention=False)
         target = model.project(entry["tokens"][index])
-        # bits per dimension: mean over patches and dims, then summed over the batch
+        # bits per dimension: mean over patches and dims, then summed over the batch,
+        # with the squared error accumulated in float32 like every reported statistic
         bits = gaussian_nll_bits(target, mu, logvar).mean(dim=(1, 2))
         horizon_sum = bits.sum() if horizon_sum is None else horizon_sum + bits.sum()
-        squared_sum += float((target - mu).detach().pow(2).mean(dim=(1, 2)).sum())
+        squared = (target.float() - mu.float()).detach().pow(2).mean(dim=(1, 2)).sum()
+        squared_sum = squared if squared_sum is None else squared_sum + squared
         horizon_items += int(index.numel())
-        per_horizon.setdefault(horizon, []).append(float(bits.mean().detach()))
+        per_horizon.setdefault(horizon, []).append(bits.mean().detach())
+    if horizon_sum is None:                      # no (anchor, horizon) pair was valid
+        horizon_sum = torch.zeros((), device=batch["observed"].device, dtype=torch.float32)
+        squared_sum = torch.zeros((), device=batch["observed"].device, dtype=torch.float32)
     horizon_nll = horizon_sum / max(horizon_items, 1)
-    present_mu, present_logvar = model.present_estimate(states[-1])
+    present_mu, present_logvar = estimate_for(len(states) - 1)
     present_bits = gaussian_nll_bits(model.project(batch["observed"][:, -1]), present_mu,
                                      present_logvar).mean()
     prior_bits = torch.stack([record["prior_nll_bits_per_dim"] for record in diagnostics]).mean()
@@ -135,18 +202,18 @@ def forward_window(model: VideoWorldModel, batch: dict, config: RunConfig, sampl
         + model_cfg.kl_beta * kl_bits
     )
     stats = {
-        "loss": float(loss.detach()),
-        "nll_bits_per_dim_horizon": float(horizon_nll.detach()),
+        "loss": loss.detach(),
+        "nll_bits_per_dim_horizon": horizon_nll.detach(),
         "mse": squared_sum / max(horizon_items, 1),
-        "prior_nll_bits_per_dim": float(prior_bits.detach()),
-        "present_nll_bits_per_dim": float(present_bits.detach()),
-        "kl_bits_per_dim": float(kl_bits.detach()),
-        "kl_bits_per_event": float(kl_bits.detach()) * model.patches * model.config.d_world,
+        "prior_nll_bits_per_dim": prior_bits.detach(),
+        "present_nll_bits_per_dim": present_bits.detach(),
+        "kl_bits_per_dim": kl_bits.detach(),
+        "kl_bits_per_event": kl_bits.detach() * model.patches * model.config.d_world,
         "n_items": horizon_items,
     }
     for horizon, values in per_horizon.items():
-        stats[f"nll_h{horizon}_bits_per_dim"] = sum(values) / len(values)
-    return loss, stats
+        stats[f"nll_h{horizon}_bits_per_dim"] = torch.stack(values).mean()
+    return loss, (materialize_stats(stats) if stats_mode == "float" else stats)
 
 
 @torch.no_grad()
@@ -158,14 +225,14 @@ def evaluate_model(model: VideoWorldModel, dataset: TokenDataset, config: RunCon
     totals = {}
     for _ in range(batches):
         windows = sampler.sample(config.train.batch_windows)
-        batch = gather_batch(dataset, windows, device)
+        batch = gather_batch(dataset, windows, device, model_config=config.model,
+                             performance=config.performance)
         states, _ = stream_observed(model, batch, sample=False)
         for (offset, horizon), entry in batch["targets"].items():
-            valid = entry["valid"]
-            index = valid.nonzero().flatten()
+            index = entry["index"]                  # precomputed rows; no device synchronisation
             if index.numel() == 0:
                 continue
-            mu, logvar, _, _ = model.predict(states[offset][index], entry["delta_seconds"][index])
+            mu, logvar, _, _ = predict_for_horizon(model, states[offset][index], entry, index)
             target = model.project(entry["tokens"][index])
             bits = gaussian_nll_bits(target, mu, logvar).mean(dim=(1, 2))
             key = (offset, horizon)
@@ -206,7 +273,13 @@ def evaluate_model(model: VideoWorldModel, dataset: TokenDataset, config: RunCon
 
 
 def save_checkpoint(path: Path, model, optimizer, step: int, config: RunConfig, sampler, provenance: dict,
-                    history: list, best: dict) -> None:
+                    history: list, best: dict, performance: dict | None = None) -> None:
+    """Write a checkpoint, including the acceleration policy that produced it.
+
+    ``performance`` records what actually ran (precision, attention kernel, optimiser
+    policy, compile status), so a later resume can refuse a policy change instead of
+    silently continuing with different numerics.
+    """
     torch.save({
         "schema_version": 2,
         "model_config": asdict(config.model),
@@ -221,6 +294,7 @@ def save_checkpoint(path: Path, model, optimizer, step: int, config: RunConfig, 
         "provenance": provenance,
         "history": history[-200:],
         "best": best,
+        "performance": performance if performance is not None else {},
     }, path)
 
 
@@ -233,15 +307,25 @@ def train(config: RunConfig, model: VideoWorldModel, train_set: TokenDataset, va
     provenance["source_signature"] = source_signature()
     provenance["train_windows"] = len(train_set)
     provenance["val_windows"] = len(val_set)
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=config.train.learning_rate,
-        weight_decay=config.train.weight_decay,
-    )
+    performance = config.performance
+    compile_status = apply_compile(model, performance)
+    optimizer = build_optimizer(model.parameters(), performance, config.train.learning_rate,
+                                config.train.weight_decay, device)
+    # the compared policy stays flat (scalars only), so a checkpoint without a record
+    # can still be resumed with the reference settings; the verbose compile status is
+    # recorded beside it for humans
+    policy = {**precision_policy(performance),
+              **training_policy(performance, model, device, compile_status),
+              "optimizer": optimizer_policy(performance, device),
+              "compile_status": compile_status}
+    trainable = [p for p in model.parameters() if p.requires_grad]
     sampler = WindowSampler(train_set, seed=config.train.seed)
     step, history = 0, []
     best = {"val_mean_nll_bits_per_dim": math.inf, "step": 0}
     if resume:
         payload = torch.load(resume, map_location="cpu", weights_only=False)
+        # a resumed run must keep the accelerations it recorded, not inherit new ones
+        require_matching_policy(payload.get("performance"), policy, "performance")
         model.load_state_dict(payload["state_dict"])
         optimizer.load_state_dict(payload["optimizer"])
         step = int(payload["step"])
@@ -251,26 +335,34 @@ def train(config: RunConfig, model: VideoWorldModel, train_set: TokenDataset, va
         best = dict(payload.get("best", best))
     else:
         save_checkpoint(out_dir / "initial.pt", model, optimizer, 0, config, sampler, provenance,
-                        history, best)
+                        history, best, policy)
     started = time.monotonic()
     log_path = out_dir / "train_log.jsonl"
     model.train()
     while step < config.train.max_steps:
         step += 1
         windows = sampler.sample(config.train.batch_windows)
-        batch = gather_batch(train_set, windows, device)
-        loss, stats = forward_window(model, batch, config, sample=True)
+        batch = gather_batch(train_set, windows, device, model_config=config.model,
+                             performance=performance)
+        with autocast_context(performance, device):
+            loss, tensor_stats = forward_window(model, batch, config, sample=True, stats_mode="tensor")
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        grad_norm = float(nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad], config.train.grad_clip_norm
-        ))
+        # the norm stays a tensor: only log/eval steps read it back to the host
+        grad_norm = nn.utils.clip_grad_norm_(trainable, config.train.grad_clip_norm)
         optimizer.step()
-        stats.update({"step": step, "grad_norm": grad_norm, "elapsed": time.monotonic() - started})
-        if step % config.train.log_interval == 0 or step == 1:
+        should_log = step % config.train.log_interval == 0 or step == 1
+        should_eval = step % config.train.eval_interval == 0 or step == config.train.max_steps
+        if should_log or should_eval:
+            stats = materialize_stats(tensor_stats)
+            stats.update({"step": step, "grad_norm": float(grad_norm),
+                          "elapsed": time.monotonic() - started})
+        if should_log:
             with log_path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(stats) + "\n")
-        if step % config.train.eval_interval == 0 or step == config.train.max_steps:
+        if should_eval:
+            # validation runs in float32: it is the yardstick that stays comparable
+            # when the training precision changes
             metrics = evaluate_model(model, val_set, config, device, config.train.eval_batches)
             per_horizon = metrics["per_horizon"]
             mean_nll = sum(v["nll_bits_per_dim"] for v in per_horizon.values()) / len(per_horizon)
@@ -278,17 +370,19 @@ def train(config: RunConfig, model: VideoWorldModel, train_set: TokenDataset, va
             if mean_nll < best["val_mean_nll_bits_per_dim"]:
                 best = {"val_mean_nll_bits_per_dim": mean_nll, "step": step}
                 save_checkpoint(out_dir / "best.pt", model, optimizer, step, config, sampler, provenance,
-                                history, best)
+                                history, best, policy)
         if time.monotonic() - started > config.train.max_wall_seconds:
             history.append({"step": step, "stopped": "wall_budget"})
             break
-    save_checkpoint(out_dir / "final.pt", model, optimizer, step, config, sampler, provenance, history, best)
+    save_checkpoint(out_dir / "final.pt", model, optimizer, step, config, sampler, provenance, history,
+                    best, policy)
     summary = {
         "steps": step,
         "wall_seconds": time.monotonic() - started,
         "best": best,
         "final_val": history[-1].get("per_horizon") if history else {},
         "provenance": provenance,
+        "performance": policy,
     }
     (out_dir / "train_summary.json").write_text(json.dumps(summary, indent=2, default=float) + "\n",
                                                 encoding="utf-8")

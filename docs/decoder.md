@@ -64,7 +64,8 @@ wpm-video train-decoder --config <config> --checkpoint <world 的 best.pt> --out
 ```
 
 - 编码器、世界模型、投影全部**冻结**：输入是 `model.project(缓存 tokens)`，目标是同一
-  分块的**最后采样帧** RGB（直接从源视频解码，`targets.py`）。
+  分块的**最后采样帧** RGB（直接从源视频解码，`targets.py`）。每个 batch 先在主机侧堆叠
+  token 行与目标帧，再一次传输、一次 `project`。
 - 划分来自 **world checkpoint 的 provenance**（`--checkpoint` 必须由本包的 `train` 写
   出）；train/val 之间按文件哈希与来源 identity 拒绝重叠。
 - 校验分两段，读日志时注意区别：
@@ -84,6 +85,17 @@ wpm-video train-decoder --config <config> --checkpoint <world 的 best.pt> --out
   架构与划分。
 - `--resume` 恢复优化器、步数、采样器/分块生成器与 CPU/CUDA 随机状态；**checkpoint 的
   架构是权威**，config 与它不一致会直接报错（否则会记录一套配置却训练另一个网络）。
+  续训还会比对 `performance` 的语义项（精度/注意力核/fused/compile），不一致时报错；
+  旧版本写的 checkpoint 没有该记录，视为参考策略。
+
+- 可选的目标关键帧磁盘缓存：`decoder_train.target_cache_dir`（默认空 = 关闭）。只保存每个
+  分块**最后一帧**（不保存整段视频），按来源 SHA-256、时间轴 schema、采样帧率与栅格、分块
+  记录（index/起止帧/起止时间）与输出分辨率寻址，条目内另有像素+时间戳+分块记录的摘要；
+  读取时逐条校验，写入用唯一临时文件 + 原子替换（并发写同一路径时先到者生效，内容按构造
+  相同）。**即使全部命中缓存，首次用到某条视频时仍会校验源文件 SHA-256**；缓存未命中时会
+  重新解码并重建/校验时间轴。视频在内存中最多保留 `decoder_train.frame_cache_videos` 条。
+  首次构建缓存要付一次解码成本，之后的运行省掉解码；`train_summary.json` 的
+  `decoded_frame_cache` 记录解码条数、命中/未命中、写入条数与字节数。
 
 `decoder_train` 字段见 [configuration.md](configuration.md#decoder_train)。
 
@@ -105,6 +117,9 @@ wpm-video query   --config <config> --checkpoint <world checkpoint> --state <sta
   `device` 上再推理（`load_decoder` 默认加载到 CPU），并恢复调用前的 train/eval 模式；
   解码器会留在该设备上。CLI 已经按 `train.device` 处理，Python API 里显式写
   `decoder = decoder.to(device).eval()` 更清楚。
+- 精度：解码器训练同样受 `performance.precision` 控制，但重建损失与 `l1`/`mse`/`psnr`
+  始终在 FP32 计算；`predict` 的默认路径保留注意力权重（reference 读），只有内部无权重
+  路径使用配置的 SDPA。加速项与数值契约见 [performance.md](performance.md)。
 - `predict` 的产物：
   - `decoded_h<horizon>.png`：**预测 mu** 解码出的关键帧；`decoded_predictions.pt` 存
     `float32 (3, S, S)`、`decoded_summary.json` 存时间元数据；

@@ -12,6 +12,7 @@ chunk spacing.
 """
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 
 import torch
@@ -20,6 +21,7 @@ from .config import DataConfig
 from .data import (Chunk, VideoInfo, build_chunks, list_videos, load_source_manifest, probe_video,
                    read_frames, resolve_source, windows_for_video)
 from .encoder import TokenCache, cache_path
+from .performance import as_device, to_device
 
 TIMELINE_SCHEMA = "t2-source-timestamps"
 
@@ -105,12 +107,27 @@ def cache_video_tokens(video, config: DataConfig, encoder, out_dir, batch_clips:
     chunks = build_chunks(info, config, timestamps)
     if not chunks:
         raise RuntimeError(f"Video too short for one chunk: {video}")
+    if batch_clips < 1:
+        raise ValueError(f"batch_clips must be >= 1, got {batch_clips}")
     tokens = []
     with torch.no_grad():
         for start in range(0, len(chunks), batch_clips):
-            for chunk in chunks[start:start + batch_clips]:
-                clip = frames[chunk.start_frame:chunk.end_frame]
-                tokens.append(encoder.encode_clip(clip).to("cpu").to(torch.float16))
+            group = chunks[start:start + batch_clips]
+            # one clip per chunk, and a clip is exactly that chunk's sampled frames:
+            # no chunk ever contains a frame from a later chunk
+            clips = torch.stack([frames[chunk.start_frame:chunk.end_frame] for chunk in group])
+            if clips.shape[1] != config.chunk_frames:
+                raise ValueError(
+                    f"{info.name}: chunk {group[0].index} holds {clips.shape[1]} frames, expected "
+                    f"{config.chunk_frames}; the sampling grid changed under the chunk list"
+                )
+            encoded = encoder.encode_clips(clips)
+            if len(encoded) != len(group):
+                raise RuntimeError(
+                    f"{info.name}: encoder returned {len(encoded)} token blocks for "
+                    f"{len(group)} clips; encode_clips must return one per clip"
+                )
+            tokens.extend(block.to("cpu").to(torch.float16) for block in encoded)
     stacked = torch.stack(tokens)
     meta = {
         "timeline_schema": TIMELINE_SCHEMA,
@@ -208,8 +225,38 @@ class WindowSampler:
         return [self.dataset.windows[int(i)] for i in order]
 
 
-def gather_batch(dataset: TokenDataset, windows: list[Window], device, dtype=torch.float32) -> dict:
-    """Stack observed chunks, timestamps and per-horizon targets for a batch of windows."""
+def substeps_for(deltas: torch.Tensor, substep_seconds: float, max_substeps: int) -> int:
+    """Integrator step count for a batch of deltas, computed on the CPU side.
+
+    Exactly the formula ``VideoWorldModel.advance`` uses (``ceil(max(delta) /
+    substep_seconds)``), evaluated while the batch is still a host tensor so the
+    integrator does not have to read a GPU maximum back to Python on every call. Any
+    mismatch would change the Euler step size, so the training path asserts equality
+    with the reference path in the test suite.
+    """
+    maximum = float(deltas.max()) if deltas.numel() else 0.0
+    steps = max(1, int(math.ceil(maximum / substep_seconds)))
+    if steps > max_substeps:
+        raise ValueError(
+            f"the longest delta in this batch needs {steps} substeps, above "
+            f"max_substeps={max_substeps}; reduce the horizon or raise substep_seconds"
+        )
+    return steps
+
+
+def gather_batch(dataset: TokenDataset, windows: list[Window], device, dtype=torch.float32,
+                 model_config=None, performance=None) -> dict:
+    """Stack observed chunks, timestamps and per-horizon targets for a batch of windows.
+
+    Everything that can be decided on the host is decided here: timestamps are
+    validated for finiteness and strict monotonicity, target deltas for being
+    strictly positive, and -- when ``model_config`` is given -- the valid row indices
+    and the integrator substep count for every anchor and horizon are precomputed on
+    CPU. The model still enforces the same contracts for direct API callers; this only
+    spares the training loop a GPU->Python synchronisation per horizon while keeping
+    the float64 clock, the partial horizon masks and heterogeneous source timestamps
+    exactly as they are.
+    """
     config = dataset.config
     observed, end_seconds = [], []
     targets: dict[tuple[int, int], dict] = {}
@@ -223,7 +270,7 @@ def gather_batch(dataset: TokenDataset, windows: list[Window], device, dtype=tor
             blocks.append(dataset.tokens(window.video, window.start + i))
             ends.append(chunk["end_seconds"])
         observed.append(torch.stack(blocks))
-        end_seconds.append(torch.tensor(ends, dtype=torch.float64))
+        end_seconds.append(ends)
         for (offset, horizon), entry in targets.items():
             target_chunk = window.start + offset + horizon
             if target_chunk < window.chunk_count:
@@ -240,25 +287,54 @@ def gather_batch(dataset: TokenDataset, windows: list[Window], device, dtype=tor
                 entry["tokens"].append(torch.zeros_like(blocks[0]))
                 entry["valid"].append(False)
                 entry["delta_seconds"].append(0.0)
+    # -- host-side validation (identical contracts, no device synchronisation) ----
+    clock = torch.tensor(end_seconds, dtype=torch.float64)          # (B, context)
+    if not bool(torch.isfinite(clock).all()):
+        raise ValueError("Observation end times must be finite")
+    if clock.shape[1] > 1 and bool((clock[:, 1:] - clock[:, :-1] <= 0).any()):
+        raise ValueError("Observation end times must be strictly increasing within a window")
+    if bool((clock <= 0).any()):
+        raise ValueError("Observation end times must be strictly later than the initial state time")
+    deltas = {key: torch.tensor(entry["delta_seconds"], dtype=torch.float64)
+              for key, entry in targets.items()}
+    for key, entry in targets.items():
+        valid = torch.tensor(entry["valid"], dtype=torch.bool)
+        delta = deltas[key]
+        if not bool(torch.isfinite(delta[valid]).all()):
+            raise ValueError(f"Target delta must be finite for {key}")
+        if bool(valid.any()) and bool((delta[valid] <= 0).any()):
+            raise ValueError(f"Target delta must be strictly positive for {key}")
+        entry["valid_index"] = valid.nonzero().flatten()
+        entry["substeps"] = (substeps_for(delta, model_config.substep_seconds,
+                                          model_config.max_substeps)
+                             if model_config is not None else None)
+    context_substeps = None
+    if model_config is not None:
+        previous = torch.cat([torch.zeros_like(clock[:, :1]), clock[:, :-1]], dim=1)
+        context_deltas = clock - previous
+        context_substeps = [substeps_for(context_deltas[:, index], model_config.substep_seconds,
+                                         model_config.max_substeps)
+                            for index in range(clock.shape[1])]
     batch = {
-        "observed": torch.stack(observed).to(device=device, dtype=dtype),
+        # transfers honour the configured pin/non-blocking policy; the values are the
+        # same with and without it
+        "observed": to_device(torch.stack(observed), device, performance, dtype=dtype),
         # Times are bookkeeping, not activations: they stay float64 even though the
         # token tensors use the model dtype, so a chunk boundary keeps full precision
         # until the integrator converts it.
-        "end_seconds": torch.stack(end_seconds).to(device=device, dtype=torch.float64),
+        "end_seconds": clock.to(device=as_device(device), dtype=torch.float64),
         "targets": {
             key: {
-                "tokens": torch.stack(entry["tokens"]).to(device=device, dtype=dtype),
-                "valid": torch.tensor(entry["valid"], device=device),
-                "delta_seconds": torch.tensor(entry["delta_seconds"], device=device,
+                "tokens": to_device(torch.stack(entry["tokens"]), device, performance, dtype=dtype),
+                "valid": torch.tensor(entry["valid"], device=as_device(device)),
+                "delta_seconds": deltas[key].to(device=as_device(device),
                                               dtype=torch.float64),
+                "index": to_device(entry["valid_index"], device, performance),  # copy once
+                "substeps": entry["substeps"],
             }
             for key, entry in targets.items()
         },
+        "context_substeps": context_substeps,
         "windows": [window.key for window in windows],
     }
-    for key, entry in batch["targets"].items():
-        valid = entry["valid"]
-        if bool(valid.any()) and bool((entry["delta_seconds"][valid] <= 0).any()):
-            raise ValueError(f"Target delta must be strictly positive for {key}")
     return batch

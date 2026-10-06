@@ -1,12 +1,14 @@
 # 配置
 
 配置是一个 JSON 文件。顶层只允许 `name`、`data`、`encoder`、`model`、`train`、
-`decoder`、`decoder_train` 七个键，未知键会在加载时报错。
+`decoder`、`decoder_train`、`performance` 八个键，未知键会在加载时报错。
 
 - **`data`、`encoder`、`model`、`train` 四个 section 必须存在**，`RunConfig.load`
   直接读取它们；只有 section 内部的字段可以省略并用默认值补齐。
 - `decoder` 与 `decoder_train` 是**可选**的（0.2.0 新增）：旧配置没有这两个 section
   也能原样加载，取默认值，世界模型各命令的行为不变。`RunConfig.save` 会把它们写全。
+- `performance` 是**可选**的（0.3.0 新增）：旧配置没有这一段时全部取参考值，行为与
+  之前完全一致。`RunConfig.save` 会把这一段写全。
 - `name` 可以省略，省略时为 `run`。
 
 生成一份包含全部默认值的配置：
@@ -146,9 +148,28 @@ config.validate()                        # load 时已自动调用
 | `l1_weight` | `1.0` | 像素 L1 权重，有限非负 |
 | `edge_weight` | `0.1` | 边缘（有限差分 L1）权重，`0` 关闭；与 `l1_weight` 不能同时为 0 |
 | `frame_cache_videos` | `2` | 目标帧按视频惰性解码，最多同时在内存里保留几条 |
+| `target_cache_dir` | `""` | 可选的**目标关键帧磁盘缓存**目录（空 = 关闭）。按来源 SHA、时间轴、采样栅格、分块记录与输出分辨率寻址，逐条校验像素摘要；命中时不再解码视频，但**仍会**先校验源视频哈希。详见 [performance.md](performance.md) |
 
 世界模型训练写出的 `config.json` 里包含这两段，因此把同一份配置交给
 `train-decoder` 时，采样参数与编码器身份天然一致。
+
+## performance
+
+可选的加速项，默认全部是参考实现。完整边界、数值契约与续训规则见
+[performance.md](performance.md)。
+
+| 字段 | 默认值 | 取值 / 约束 |
+|---|---|---|
+| `precision` | `float32` | `float32` 或 `bfloat16`（bfloat16 只需 `torch.autocast`，不需要 loss scaler） |
+| `anchor_attention` | `reference` | `reference`（返回注意力权重）或 `sdpa`（融合核，不返回权重） |
+| `fused_optimizer` | `false` | 布尔；仅 CUDA 可用，CPU 上请求会报错而不是静默退回 |
+| `compile` | `false` | 布尔；只编译 predictor head，是否可用取决于 torch 版本/后端/平台 |
+| `pin_memory` | `false` | 布尔；仅 CUDA 生效 |
+| `non_blocking` | `false` | 布尔；仅 CUDA 生效 |
+
+无论怎么设置：持久状态是 FP32、时钟是 float64、概率/投影/标准化与所有上报指标在 FP32
+计算，冻结编码器的 cache 保持 FP32 且缓存键不变。检查点记录实际生效的策略，续训时语义项
+（精度/注意力核/fused/compile）改变会被拒绝，设备与 pinned 传输等元数据差异不会。
 
 ## 检查点与状态
 
@@ -157,8 +178,8 @@ config.validate()                        # load 时已自动调用
 
 解码器的 checkpoint 名字相同但内容不同（`kind="rgb_decoder"`）：解码器配置与架构、
 **world 投影 buffer 的 SHA-256 指纹**、编码器身份、采样参数、目标帧语义与分辨率、
-优化器、步数、两个采样生成器与 CPU/CUDA 随机状态。给 `--decoder-checkpoint` 传世界模型
-checkpoint 会被明确拒绝。见 [decoder.md](decoder.md)。
+优化器、步数、两个采样生成器与 CPU/CUDA 随机状态，以及实际生效的 `performance` 策略。
+给 `--decoder-checkpoint` 传世界模型 checkpoint 会被明确拒绝。见 [decoder.md](decoder.md)。
 
 - 用 `--resume <checkpoint>` 继续训练：恢复优化器与随机状态，沿用配置里的数据划分，
   `max_steps` 为总目标步数。`initial.pt` 只在新训练时写出，`best.pt` 只在验证指标

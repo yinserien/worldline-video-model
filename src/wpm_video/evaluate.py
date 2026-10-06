@@ -25,7 +25,8 @@ def iter_windows(dataset: TokenDataset, config: RunConfig, device, batches: int,
     sampler = WindowSampler(dataset, seed=seed)
     for _ in range(batches):
         windows = sampler.sample(config.train.batch_windows)
-        yield windows, gather_batch(dataset, windows, device)
+        yield windows, gather_batch(dataset, windows, device, model_config=config.model,
+                                    performance=config.performance)
 
 
 def baseline_prediction(kind: str, observed, offset: int, horizon: int, train_mean):

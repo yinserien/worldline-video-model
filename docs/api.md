@@ -40,11 +40,17 @@ config.to_dict()                         # 嵌套 dict
 encoder = build_encoder(config.encoder, device, allow_native=False)
 encoder.kind, encoder.d_model, encoder.patches   # 后端、token 宽度、空间 patch 数
 tokens = encoder.encode_clip(clip)               # (T,3,H,W) uint8 -> (P, d_model)
+batch = encoder.encode_clips(clips)              # (B,T,3,H,W) uint8 -> [B × (P, d_model)]
 tokens = tokens.to(device).unsqueeze(0)          # -> (1, P, d_model)，observe 需要这个形状
 ```
 
-`vjepa2` 为冻结的真实编码器（推理在 `torch.no_grad` 下）；`native` 为随机初始化，
-需要 `allow_native=True`，只用于测试与离线示例。真实 run 不会静默退回 native。
+- `encode_clips` 是缓存路径使用的批处理入口：一个 clip 恰好是一个分块的采样帧，所以不会
+  有分块看到后面分块的帧；`encode_clip` 等价于 `encode_clips(clip.unsqueeze(0))[0]`。
+  只实现 `encode_clip` 的自定义编码器会自动退回逐条串行（`Encoder.encode_clips` 基类
+  实现）。`cache_video_tokens` 的 `batch_clips` 就是真实 batch 大小。
+- `vjepa2` 为冻结的真实编码器（推理在 `torch.no_grad` 下）；`native` 为随机初始化，
+  需要 `allow_native=True`，只用于测试与离线示例。真实 run 不会静默退回 native。
+  编码器始终以 FP32 运行：精度不是配置项，也不进缓存键与解码器兼容性记录。
 
 ## 视频与分块
 
@@ -101,10 +107,17 @@ mu, logvar, advanced, attention = model.predict(state, delta_seconds)
   用后验均值（确定性），训练时采样；传入 `generator` 可固定随机源。
 - `advance`：只改变状态，不读任何观测；`delta_seconds` 可为标量或每行一个
   （`(B,)` 张量），必须非负、有限，且不超过 `model.config.max_substeps` 个积分步。
-  `delta_seconds == 0` 返回等值副本。
+  `delta_seconds == 0` 是 no-op：返回等值副本，此时不计算也不检查步数。
+  `substeps=` 是给已经用 `substeps_for` 在主机侧算好步数的调用方的一致性检查：必须等于
+  `ceil(max(delta)/substep_seconds)`，否则报错（校验从不跳过）。训练循环用的是内部
+  plan 路径，只对 `gather_batch` 主机侧校验过的 batch 生效。
 - `predict`：返回 `mu`、`logvar`（形状 `(B, P, d_world)`）、推进后的状态与注意力。
   `logvar` 是**对数方差**，范围由 `model.config.logvar_min/logvar_max` 限制；
   `sigma = exp(0.5 * logvar)`。`observe` 与 `predict` 都接受 batched 状态。
+  `predict(..., want_attention=True)` 是默认值：即使 `performance.anchor_attention="sdpa"`
+  也会走 reference 读以返回真实注意力权重；传 `False` 才使用配置的核并返回
+  `attention=None`（训练/验证/推理内部路径都显式传 `False`）。
+  `reference_mu=` 可复用同一状态已经算好的 present 估计（多 horizon 共享，梯度照常累加）。
 
 ## 流式与查询
 
@@ -239,6 +252,30 @@ metrics = evaluate_model(model, val_set, config, device, batches=8)
 - `evaluate_model(model, val_set, ...)` 只读验证集缓存；`fit_baseline_stats(model,
   train_set, ...)` 额外需要训练集缓存来拟合基线统计量，`evaluate_baselines` 再用它
   在验证集上评分。CLI `eval` 两条路径都要，因此 train 与 val 缓存缺一不可。
+
+## 性能选项
+
+```python
+from wpm_video import (PerformanceConfig, apply_compile, autocast_context, build_optimizer,
+                       materialize_stats, should_pin, substeps_for, to_device)
+
+config.performance = PerformanceConfig(precision="bfloat16", anchor_attention="sdpa",
+                                       fused_optimizer=True, compile=False, pin_memory=True)
+```
+
+| 调用 | 说明 |
+|---|---|
+| `PerformanceConfig(...)` | 加速开关；默认全部是参考实现。字段与边界见 [performance.md](performance.md) |
+| `autocast_context(performance, device)` | `bfloat16` 时返回 autocast 上下文，否则 no-op；`device` 可传字符串或 `None` |
+| `build_optimizer(params, performance, lr, wd, device)` | AdamW；`fused_optimizer` 在非 CUDA 上抛 `PerformanceError`，不会静默退回 |
+| `apply_compile(model, performance, compile_fn=None)` | 只编译 predictor head（纯可调用对象，不改 `state_dict` 键），并跑一次预检证明能执行；返回状态记录（`disabled`/`applied`/`unverified`），失败抛 `PerformanceError` |
+| `to_device(tensor, device, performance=None)` | 按策略搬运（CUDA 上可选 pinned/非阻塞）；`performance=None` 即参考行为 |
+| `substeps_for(deltas, substep_seconds, max_substeps)` | 主机侧按与积分器相同的公式算步数 |
+| `materialize_stats(stats)` | 把 `forward_window(..., stats_mode="tensor")` 的统计量转成 float |
+
+数值契约：bfloat16 只作用于模型计算；持久状态 FP32、时钟 float64、NLL/KL 与投影标准化
+以及所有上报指标都在 FP32；冻结编码器 FP32。检查点记录实际生效的策略，续训拒绝语义项
+（精度/注意力核/fused/compile）变化，忽略设备与 pinned 等元数据差异。
 
 ## 单位
 

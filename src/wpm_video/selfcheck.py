@@ -150,9 +150,12 @@ def check_deterministic_inference_and_rng() -> tuple:
 def check_observation_free_advance() -> tuple:
     model, _ = build_fixture()
     state = model.initial_state(1, torch.device("cpu"), torch.float32)
-    frames_a = torch.randn(24, 3, 64, 64, generator=torch.Generator().manual_seed(1))
+    # frames enter an encoder as uint8, exactly as read_frames produces them
+    frames_a = torch.randint(0, 256, (24, 3, 64, 64), dtype=torch.uint8,
+                             generator=torch.Generator().manual_seed(1))
     frames_b = frames_a.clone()
-    frames_b[16:] = torch.randn(8, 3, 64, 64, generator=torch.Generator().manual_seed(2))
+    frames_b[16:] = torch.randint(0, 256, (8, 3, 64, 64), dtype=torch.uint8,
+                                  generator=torch.Generator().manual_seed(2))
     encoder = NativeEncoder(d_model=48, image_size=64, patch=16, tubelet=2, seed=0)
     chunks = [Chunk("v", i, i * 8, i * 8 + 8, i * 2.0, i * 2.0 + 2.0) for i in range(3)]
     prefix_chunks = chunks[:2]

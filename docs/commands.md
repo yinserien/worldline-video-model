@@ -33,6 +33,10 @@ wpm-video cache --config <config> [--out <manifest.json>]
 来源 identity、编码器 revision）。若 `video_dir` 下存在 `sources.json`，会把其中
 声明的公开来源与文件 bytes 逐字节核对后再写入记录。
 
+编码按 `encoder.batch_clips` 分批调用 `encode_clips`（native 一次 `conv3d`，V-JEPA2
+一次模型调用），最后一个不满的批次同样处理；批大小不改变 token 数值（fp16 存储精度内）
+也不改变缓存键。编码器始终以 FP32 运行。
+
 ## train
 
 ```text
@@ -79,7 +83,11 @@ wpm-video train-decoder --config <config> --checkpoint <world 的 checkpoint> --
 - 产物：`initial.pt`/`best.pt`/`final.pt`（按留出 L1）、`train_log.jsonl`、
   `train_summary.json`（含 `l1`/`mse`/`psnr_db`、`constant_frame_reference`、`per_video`）、
   `config.json` 与 `splits.json`（写实际生效的架构与划分）。
-- 细节与指标定义见 [decoder.md](decoder.md)。
+- 每个 batch 先在主机侧堆叠 token 与目标帧，再一次传输、一次投影；CUDA 上可开启
+  `performance.pin_memory` / `non_blocking`。
+- 可选 `decoder_train.target_cache_dir` 缓存目标关键帧：命中时不解码视频，但**仍会**校验
+  源文件哈希，未命中会重新解码并校验时间轴。
+- 细节与指标定义见 [decoder.md](decoder.md)，加速项见 [performance.md](performance.md)。
 
 ## eval
 
@@ -155,6 +163,24 @@ wpm-video query --config <config> --checkpoint <checkpoint> --state <world_state
   `decoded_summary.json`。查询没有视频，因此 `source_fps` 与
   `target_frame_timestamp_seconds` 记为 `null`，并在 `timestamp_basis` 说明像素时间未知
   ——分块结束时间只是查询锚点，不会被当成帧的拍摄时间。
+
+## benchmark
+
+合成基准**不是 CLI 命令**，而是随源码发行包提供的脚本，用已安装的包 API 计时世界模型与
+解码器的单步训练（不含预训练编码器、视频 IO、评估与 checkpoint 落盘）：
+
+```text
+python examples/benchmark.py --out <包外基准目录> [--config <包外 run config>]
+                             [--device cuda|cpu] [--batch N] [--decoder-batch N]
+                             [--steps N] [--warmup N] [--repeats N]
+                             [--encoder-width N] [--grid-side N] [--profile]
+```
+
+产物全部写到 `--out`：`benchmark.json`（每步中位数、items/s、各次重复、参数量、CUDA
+allocated/reserved 峰值、TF32 开关、seed、配置、源码签名与 `world_compile` 状态），
+`--profile` 时另有 `<case>_trace.json` 与 `<case>_top_operators.txt`。编码器/缓存的批处理
+收益请单独计时（例如 `cache` 冷/暖各一次），不要与单步数字相加。读法与注意事项见
+[performance.md](performance.md)。
 
 ## provenance
 

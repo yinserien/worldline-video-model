@@ -40,7 +40,9 @@ from torch import nn
 from ..config import RunConfig, decoder_architecture
 from ..dataset import TokenDataset, WindowSampler, check_split_integrity
 from ..model import VideoWorldModel
-from ..train import rng_restore, rng_snapshot, set_determinism, source_signature
+from ..performance import (autocast_context, build_optimizer, optimizer_policy, precision_policy,
+                           require_matching_policy, should_pin, to_device)
+from ..train import materialize_stats, rng_restore, rng_snapshot, set_determinism, source_signature
 from .compat import (DecoderCompatibilityError, check_decoder_compatibility, decoder_identity)
 from .model import build_decoder, save_decoder
 from .targets import ChunkFrameSource, alignment_record
@@ -99,7 +101,8 @@ def prepare_decoder_data(config: RunConfig, world_payload: dict, image_size: int
         for dataset in (train_set, val_set):
             check_cache_matches_world(dataset, world_model, config)
     source = ChunkFrameSource(config.data.video_dir, config.data, image_size,
-                              max_videos=config.decoder_train.frame_cache_videos)
+                              max_videos=config.decoder_train.frame_cache_videos,
+                              target_cache_dir=config.decoder_train.target_cache_dir)
     for dataset in (train_set, val_set):
         for name, cache in dataset.entries.items():
             source.register(name, alignment_record(cache, require_identity=True))
@@ -123,21 +126,31 @@ def context_chunk_indices(dataset: TokenDataset, window) -> list:
 
 @torch.no_grad()
 def gather_decoder_batch(world_model, frame_source: ChunkFrameSource, dataset: TokenDataset,
-                         windows: list, device, generator=None, deterministic: bool = False):
-    """Stack projected latents, their target keyframes and the target timestamps."""
-    latents, targets, records = [], [], []
+                         windows: list, device, generator=None, deterministic: bool = False,
+                         performance=None):
+    """Stack projected latents, their target keyframes and the target timestamps.
+
+    The host side does all the per-example work first -- token rows from the cache,
+    target keyframes from the frame source -- and only then transfers once and
+    projects once for the whole batch, instead of one transfer and one projection per
+    example. With ``performance.pin_memory`` on CUDA the two host stacks are pinned
+    and copied asynchronously; the values are identical either way, so pinning is a
+    transfer detail, never a numerical one.
+    """
+    token_rows, frame_rows, records = [], [], []
     for window in windows:
         indices = (context_chunk_indices(dataset, window) if deterministic
                    else sample_chunk_indices(dataset, window, generator))
         for index in indices:
-            tokens = dataset.tokens(window.video, index).to(device).float().unsqueeze(0)
-            latent = world_model.project(tokens)[0]
+            token_rows.append(dataset.tokens(window.video, index))
             frame, timestamp = frame_source.target_frame(window.video,
                                                          dataset.chunk(window.video, index))
-            latents.append(latent)
-            targets.append(frame.to(device).float().div_(255.0))
+            frame_rows.append(frame)
             records.append({"video": window.video, "chunk": index, "target_time_seconds": timestamp})
-    return torch.stack(latents), torch.stack(targets), records
+    tokens = to_device(torch.stack(token_rows), device, performance).float()
+    latents = world_model.project(tokens)              # one batched projection
+    targets = to_device(torch.stack(frame_rows), device, performance).float().div_(255.0)
+    return latents, targets, records
 
 
 @torch.no_grad()
@@ -179,12 +192,22 @@ def edge_l1(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 def decoder_loss(prediction: torch.Tensor, target: torch.Tensor, l1_weight: float,
-                 edge_weight: float) -> tuple:
-    """Weighted L1 (+ optional edge) reconstruction loss and its parts."""
+                 edge_weight: float, stats_mode: str = "float") -> tuple:
+    """Weighted L1 (+ optional edge) reconstruction loss and its parts.
+
+    The loss is evaluated in float32 even when the decoder ran under reduced
+    precision, so the reported numbers keep their meaning. ``stats_mode="tensor"``
+    returns the parts as detached tensors, letting a training loop skip the
+    GPU->Python synchronisation on steps that do not log.
+    """
+    if stats_mode not in ("float", "tensor"):
+        raise ValueError(f"stats_mode must be 'float' or 'tensor', got {stats_mode!r}")
+    prediction, target = prediction.float(), target.float()
     l1 = (prediction - target).abs().mean()
     edge = edge_l1(prediction, target)
     loss = l1_weight * l1 + edge_weight * edge
-    return loss, {"l1": float(l1.detach()), "edge": float(edge.detach())}
+    stats = {"l1": l1.detach(), "edge": edge.detach()}
+    return loss, (stats if stats_mode == "tensor" else materialize_stats(stats))
 
 
 def psnr_db(mse: float) -> float:
@@ -210,7 +233,8 @@ def evaluate_decoder(world_model, decoder, dataset: TokenDataset, frame_source: 
     for _ in range(batches):
         windows = sampler.sample(config.decoder_train.batch_windows)
         latents, targets, records = gather_decoder_batch(
-            world_model, frame_source, dataset, windows, device, deterministic=True
+            world_model, frame_source, dataset, windows, device, deterministic=True,
+            performance=config.performance
         )
         prediction = decoder(latents)
         difference = prediction - targets
@@ -257,12 +281,14 @@ def evaluate_decoder(world_model, decoder, dataset: TokenDataset, frame_source: 
 
 # -- training -----------------------------------------------------------------
 def _checkpoint_extra(decoder, world_model, config: RunConfig, optimizer, step, sampler, generator,
-                      provenance, history, best, world_checkpoint, metrics, metrics_step) -> dict:
-    """Everything a resume needs: weights, optimiser, step and every RNG stream.
+                      provenance, history, best, world_checkpoint, metrics, metrics_step,
+                      performance=None) -> dict:
+    """Everything a resume needs: weights, optimiser, step, RNG streams and policy.
 
     Both the window sampler and the chunk-selection generator are saved, plus the
     global torch/CUDA streams: missing one of them would make a resumed run a
-    *different* run rather than a continuation.
+    *different* run rather than a continuation. ``performance`` records the
+    acceleration policy that actually ran, so resuming cannot silently change it.
     """
     return {
         **decoder_identity(decoder, world_model, config),
@@ -279,15 +305,17 @@ def _checkpoint_extra(decoder, world_model, config: RunConfig, optimizer, step, 
         "metrics": metrics,
         "metrics_step": metrics_step,
         "parameters": decoder.parameter_count(),
+        "performance": performance if performance is not None else {},
     }
 
 
 def save_decoder_checkpoint(path, decoder, world_model, config, optimizer, step, sampler, generator,
                             provenance, history, best, world_checkpoint, metrics=None,
-                            metrics_step=None) -> None:
+                            metrics_step=None, performance=None) -> None:
     save_decoder(path, decoder, _checkpoint_extra(decoder, world_model, config, optimizer, step,
                                                   sampler, generator, provenance, history, best,
-                                                  world_checkpoint, metrics, metrics_step))
+                                                  world_checkpoint, metrics, metrics_step,
+                                                  performance))
 
 
 def train_decoder(config: RunConfig, world_model: VideoWorldModel, decoder, frame_source,
@@ -317,8 +345,23 @@ def train_decoder(config: RunConfig, world_model: VideoWorldModel, decoder, fram
     provenance["splits"] = splits or provenance.get("splits") or {}
     provenance["decoder_parameters"] = decoder.parameter_count()
     world_checkpoint = dict(world_checkpoint or {})
-    optimizer = torch.optim.AdamW(decoder.parameters(), lr=settings.learning_rate,
-                                  weight_decay=settings.weight_decay)
+    performance = config.performance
+    optimizer = build_optimizer(decoder.parameters(), performance, settings.learning_rate,
+                                settings.weight_decay, device)
+    policy = {
+        **precision_policy(performance),
+        "optimizer": optimizer_policy(performance, device),
+        # the compared policy stays flat (scalars only); the verbose compile status is
+        # recorded beside it. Compiling a decoder module would wrap it (and its
+        # state_dict), so the hook is deliberately not applied here and the checkpoint
+        # says so instead of recording an acceleration that never ran.
+        "compile": False,
+        "compile_status": {"compile": bool(performance.compile), "applied": False,
+                           "reason": "not applied to the decoder",
+                           "targets": []},
+        # the effective flag, not the request: pinned transfers only exist on CUDA
+        "pin_memory": should_pin(performance, device),
+    }
     sampler = WindowSampler(train_set, seed=settings.seed)
     generator = torch.Generator().manual_seed(settings.seed)
     step, history = 0, []
@@ -326,6 +369,7 @@ def train_decoder(config: RunConfig, world_model: VideoWorldModel, decoder, fram
     metrics, metrics_step = {}, None
     if resume:
         payload = torch.load(resume, map_location="cpu", weights_only=False)
+        require_matching_policy(payload.get("performance"), policy, "performance")
         check_decoder_compatibility(payload, world_model, config, decoder)
         decoder.load_state_dict(payload["state_dict"])
         optimizer.load_state_dict(payload["optimizer"])
@@ -339,7 +383,8 @@ def train_decoder(config: RunConfig, world_model: VideoWorldModel, decoder, fram
         print(f"resumed decoder from {resume} at step {step}", flush=True)
     else:
         save_decoder_checkpoint(out_dir / "initial.pt", decoder, world_model, config, optimizer, 0,
-                                sampler, generator, provenance, history, best, world_checkpoint)
+                                sampler, generator, provenance, history, best, world_checkpoint,
+                                performance=policy)
     def record_evaluation(reason: str) -> None:
         """Score the current weights, log them, and keep ``best.pt`` up to date.
 
@@ -363,7 +408,7 @@ def train_decoder(config: RunConfig, world_model: VideoWorldModel, decoder, fram
                     "val_psnr_db": metrics["psnr_db"], "step": step}
             save_decoder_checkpoint(out_dir / "best.pt", decoder, world_model, config, optimizer,
                                     step, sampler, generator, provenance, history, best,
-                                    world_checkpoint, metrics, metrics_step)
+                                    world_checkpoint, metrics, metrics_step, policy)
 
     started = time.monotonic()
     log_path = out_dir / "train_log.jsonl"
@@ -372,19 +417,27 @@ def train_decoder(config: RunConfig, world_model: VideoWorldModel, decoder, fram
         step += 1
         windows = sampler.sample(settings.batch_windows)
         latents, targets, _ = gather_decoder_batch(world_model, frame_source, train_set, windows,
-                                                   device, generator=generator)
-        prediction = decoder(latents)
-        loss, parts = decoder_loss(prediction, targets, settings.l1_weight, settings.edge_weight)
+                                                   device, generator=generator,
+                                                   performance=performance)
+        with autocast_context(performance, device):
+            prediction = decoder(latents)
+        # the reconstruction loss is evaluated in float32 whatever the model computed in
+        loss, tensor_parts = decoder_loss(prediction, targets, settings.l1_weight,
+                                          settings.edge_weight, stats_mode="tensor")
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        grad_norm = float(nn.utils.clip_grad_norm_(decoder.parameters(), settings.grad_clip_norm))
+        # the norm stays a tensor; only logging reads it back to the host
+        grad_norm = nn.utils.clip_grad_norm_(decoder.parameters(), settings.grad_clip_norm)
         optimizer.step()
-        record = {"step": step, "loss": float(loss.detach()), **parts, "grad_norm": grad_norm,
-                  "elapsed": time.monotonic() - started}
-        if step % settings.log_interval == 0 or step == 1:
+        should_log = step % settings.log_interval == 0 or step == 1
+        should_eval = step % settings.eval_interval == 0 or step == settings.max_steps
+        if should_log or should_eval:
+            record = {"step": step, "loss": float(loss.detach()), **materialize_stats(tensor_parts),
+                      "grad_norm": float(grad_norm), "elapsed": time.monotonic() - started}
+        if should_log:
             with log_path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(record) + "\n")
-        if step % settings.eval_interval == 0 or step == settings.max_steps:
+        if should_eval:
             record_evaluation("")
         if time.monotonic() - started > settings.max_wall_seconds:
             history.append({"step": step, "stopped": "wall_budget"})
@@ -395,7 +448,7 @@ def train_decoder(config: RunConfig, world_model: VideoWorldModel, decoder, fram
         record_evaluation("final checkpoint evaluation")
     save_decoder_checkpoint(out_dir / "final.pt", decoder, world_model, config, optimizer, step,
                             sampler, generator, provenance, history, best, world_checkpoint, metrics,
-                            metrics_step)
+                            metrics_step, policy)
     summary = {
         "kind": "rgb_decoder",
         "steps": step,
@@ -414,9 +467,8 @@ def train_decoder(config: RunConfig, world_model: VideoWorldModel, decoder, fram
         "world_checkpoint": world_checkpoint,
         "splits": provenance["splits"],
         "provenance": provenance,
-        "decoded_frame_cache": {"videos_decoded": frame_source.decoded_videos,
-                                "content_hashes_verified": frame_source.verified_hashes,
-                                "max_videos_in_ram": frame_source.max_videos},
+        "performance": policy,
+        "decoded_frame_cache": frame_source.counters(),
         "units": METRIC_NOTE,
         "notes": [
             "the decoder reconstructs one keyframe per chunk (the last sampled frame); it is not "

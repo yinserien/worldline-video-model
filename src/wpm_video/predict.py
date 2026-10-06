@@ -172,7 +172,8 @@ def predict_at(model, state: WorldState, deltas_seconds) -> dict:
     deltas = torch.as_tensor(deltas_seconds, dtype=torch.float64).reshape(-1)
     outputs = {}
     for delta in deltas.tolist():
-        mu, logvar, advanced, attention = model.predict(state, float(delta))
+        # inference does not use attention weights: use the configured kernel
+        mu, logvar, advanced, _ = model.predict(state, float(delta), want_attention=False)
         outputs[float(delta)] = {
             "delta_seconds": float(delta),
             "target_time_seconds": float(state.time) + float(delta),
@@ -199,7 +200,7 @@ def predict_future(model, encoder, frames: torch.Tensor, state: WorldState, targ
             delta = float(target_chunk.end_seconds) - base_time
         else:
             delta = horizon * chunk_seconds
-        mu, logvar, advanced, attention = model.predict(state, delta)
+        mu, logvar, advanced, _ = model.predict(state, delta, want_attention=False)
         entry = {
             "horizon_chunks": horizon,
             "delta_seconds": delta,

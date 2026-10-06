@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "worldline-video-model"
-version = "0.2.0"
+version = "0.3.0"
 description = "Persistent-state video world model over frozen video-encoder latents, with an optional latent-to-RGB decoder"
 readme = "README.md"
 requires-python = ">=3.10"

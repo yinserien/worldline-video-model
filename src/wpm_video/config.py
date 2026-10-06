@@ -132,6 +132,36 @@ class DecoderTrainConfig:
     l1_weight: float = 1.0
     edge_weight: float = 0.1     # small finite-difference edge term; 0 disables it
     frame_cache_videos: int = 2  # per-video RGB frames held in RAM at most
+    target_cache_dir: str = ""   # optional on-disk cache of decoder target keyframes
+
+
+@dataclass
+class PerformanceConfig:
+    """Optional accelerations. Every default is the reference FP32 behaviour.
+
+    Nothing here changes results by itself: a run with the defaults does exactly what
+    earlier versions did. Each option is explicit, recorded in the checkpoints that
+    were produced with it, and refused (rather than silently downgraded) when the
+    running platform cannot honour it.
+
+    ``precision`` applies to model *compute* only: the persistent state stays
+    float32, clocks stay float64, and the Gaussian NLL/KL, the projection
+    standardisation and every reported statistic are evaluated in float32, so a
+    metric keeps its meaning when the precision changes. ``bfloat16`` is offered
+    instead of float16 because it needs no loss scaler.
+
+    The video encoder deliberately stays float32 and is not configurable here: its
+    precision would change token values and therefore the cache identity and the
+    decoder compatibility record, which is not worth invalidating every existing
+    cache for.
+    """
+
+    precision: str = "float32"            # "float32" | "bfloat16"
+    anchor_attention: str = "reference"   # "reference" (returns weights) | "sdpa"
+    fused_optimizer: bool = False         # torch fused AdamW; CUDA only
+    compile: bool = False                 # torch.compile on selected pure hot paths
+    pin_memory: bool = False              # pinned host buffers + non-blocking copies
+    non_blocking: bool = False            # async H2D; implied by pin_memory on CUDA
 
 
 @dataclass
@@ -143,6 +173,7 @@ class RunConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
     decoder_train: DecoderTrainConfig = field(default_factory=DecoderTrainConfig)
+    performance: PerformanceConfig = field(default_factory=PerformanceConfig)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -236,6 +267,11 @@ class RunConfig:
             if not data.train_videos or not data.val_videos:
                 raise ValueError("both train_videos and val_videos must be given, or neither")
         self.validate_decoder()
+        self.validate_performance()
+
+    def validate_performance(self) -> None:
+        """Acceleration settings, checked before a run starts."""
+        validate_performance_config(self.performance)
 
     def validate_decoder(self) -> None:
         """Decoder sections, checked even when no decoder is trained.
@@ -256,12 +292,13 @@ class RunConfig:
     def load(cls, path) -> "RunConfig":
         path = Path(path)
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        known = {"name", "data", "encoder", "model", "train", "decoder", "decoder_train"}
+        known = {"name", "data", "encoder", "model", "train", "decoder", "decoder_train",
+                 "performance"}
         unknown = set(payload) - known
         if unknown:
             raise ValueError(f"Unknown configuration sections: {sorted(unknown)}")
-        # decoder sections are optional: a config written before the decoder existed
-        # loads unchanged and keeps the behaviour of the world-model commands
+        # decoder and performance sections are optional: a config written before they
+        # existed loads unchanged and keeps the reference behaviour
         config = cls(
             name=payload.get("name", "run"),
             data=DataConfig(**payload["data"]),
@@ -270,6 +307,7 @@ class RunConfig:
             train=TrainConfig(**payload["train"]),
             decoder=DecoderConfig(**payload.get("decoder", {})),
             decoder_train=DecoderTrainConfig(**payload.get("decoder_train", {})),
+            performance=PerformanceConfig(**payload.get("performance", {})),
         )
         config.validate()
         return config
@@ -323,6 +361,29 @@ def validate_decoder_config(decoder: DecoderConfig,
             raise ValueError(f"decoder_train.{name} must be finite and non-negative")
     if settings.l1_weight + settings.edge_weight <= 0:
         raise ValueError("at least one decoder reconstruction weight must be positive")
+    if not isinstance(settings.target_cache_dir, str):
+        raise ValueError("decoder_train.target_cache_dir must be a string path "
+                         "(empty disables the on-disk target cache)")
+
+
+def validate_performance_config(performance: PerformanceConfig) -> None:
+    """Reject an acceleration that the implementation cannot honour as written.
+
+    Platform-dependent requests (fused optimiser, compile) are *not* judged here --
+    that belongs to the run, which knows its device -- but an unknown or malformed
+    value is refused immediately so a typo can never be ignored.
+    """
+    from .performance import PRECISIONS, ATTENTION_MODES
+
+    if performance.precision not in PRECISIONS:
+        raise ValueError(f"performance.precision must be one of {sorted(PRECISIONS)}, "
+                         f"got {performance.precision!r}")
+    if performance.anchor_attention not in ATTENTION_MODES:
+        raise ValueError(f"performance.anchor_attention must be one of "
+                         f"{sorted(ATTENTION_MODES)}, got {performance.anchor_attention!r}")
+    for name in ("fused_optimizer", "compile", "pin_memory", "non_blocking"):
+        if not isinstance(getattr(performance, name), bool):
+            raise ValueError(f"performance.{name} must be a boolean")
 
 
 def decoder_architecture(config: "DecoderConfig") -> dict:

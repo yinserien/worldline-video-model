@@ -27,7 +27,15 @@ VJEPA2_STD = (0.229, 0.224, 0.225)
 
 
 class Encoder:
-    """Interface: ``encode_clip`` maps (T, 3, H, W) uint8 frames to (P, D) tokens."""
+    """Interface: ``encode_clip`` maps (T, 3, H, W) uint8 frames to (P, D) tokens.
+
+    ``encode_clips`` is the batch entry point used by caching: it takes
+    ``(B, T, 3, H, W)`` and returns a list of ``B`` ``(P, D)`` token tensors, one per
+    clip, in input order. Each clip still covers exactly one chunk's frames, so no
+    chunk ever sees another chunk's future. Backends that can process a real batch
+    override it; the base implementation is a serial fallback, which keeps
+    third-party encoders that only define ``encode_clip`` working unchanged.
+    """
 
     kind = "base"
     is_pretrained = False
@@ -44,6 +52,26 @@ class Encoder:
 
     def encode_clip(self, clip: torch.Tensor) -> torch.Tensor:  # pragma: no cover - interface
         raise NotImplementedError
+
+    def encode_clips(self, clips: torch.Tensor) -> list:
+        """Batched encoding; the default is a safe serial fallback per clip."""
+        check_clips(clips)
+        return [self.encode_clip(clips[index]) for index in range(clips.shape[0])]
+
+
+def check_clips(clips: torch.Tensor) -> None:
+    """Shared shape contract for ``encode_clips``: (B, T, 3, H, W) uint8."""
+    if not torch.is_tensor(clips) or clips.dim() != 5:
+        raise ValueError(
+            f"encode_clips expects a (B, T, 3, H, W) uint8 tensor, got "
+            f"{tuple(clips.shape) if torch.is_tensor(clips) else type(clips)}"
+        )
+    if clips.shape[0] < 1:
+        raise ValueError("encode_clips needs at least one clip")
+    if clips.shape[2] != 3:
+        raise ValueError(f"encode_clips expects 3 colour channels, got {clips.shape[2]}")
+    if clips.dtype != torch.uint8:
+        raise ValueError(f"encode_clips expects uint8 frames, got {clips.dtype}")
 
 
 class VJEPA2Encoder(Encoder):
@@ -67,20 +95,32 @@ class VJEPA2Encoder(Encoder):
         super().__init__(self.model.config.hidden_size, (image // patch, image // patch))
         self.revision = getattr(self.model.config, "_commit_hash", None) or config.revision
         self.tubelet = self.model.config.tubelet_size
+        # The normalisation constants never change, so they are built once here
+        # instead of per clip; the shape broadcasts over (B, T, C, H, W).
+        self.register_normalisation()
+
+    def register_normalisation(self) -> None:
+        self.mean = torch.tensor(VJEPA2_MEAN, device=self.device).view(1, 1, 3, 1, 1)
+        self.std = torch.tensor(VJEPA2_STD, device=self.device).view(1, 1, 3, 1, 1)
+
+    @torch.no_grad()
+    def encode_clips(self, clips: torch.Tensor) -> list:
+        """(B, T, 3, H, W) uint8 -> B (P, D) token tensors of the last temporal position."""
+        check_clips(clips)
+        pixels = clips.to(self.device).float().div_(255.0)
+        pixels = (pixels - self.mean) / self.std
+        if pixels.shape[1] % self.tubelet:
+            pixels = pixels[:, : pixels.shape[1] - (pixels.shape[1] % self.tubelet)]
+        output = self.model(pixel_values_videos=pixels, skip_predictor=True)
+        tokens = output.last_hidden_state                       # (B, T' * P, D)
+        temporal = tokens.shape[1] // self.patches
+        per_clip = tokens.view(tokens.shape[0], temporal, self.patches, self.d_model)
+        return list(per_clip[:, -1].contiguous())
 
     @torch.no_grad()
     def encode_clip(self, clip: torch.Tensor) -> torch.Tensor:
         """(T, 3, H, W) uint8 -> (P, D) tokens of the last temporal position."""
-        pixels = clip.to(self.device).float().div_(255.0)
-        mean = torch.tensor(VJEPA2_MEAN, device=self.device).view(1, 1, 3, 1, 1)
-        std = torch.tensor(VJEPA2_STD, device=self.device).view(1, 1, 3, 1, 1)
-        pixels = (pixels.unsqueeze(0) - mean) / std
-        if pixels.shape[1] % self.tubelet:
-            pixels = pixels[:, : pixels.shape[1] - (pixels.shape[1] % self.tubelet)]
-        output = self.model(pixel_values_videos=pixels, skip_predictor=True)
-        tokens = output.last_hidden_state[0]
-        temporal = tokens.shape[0] // self.patches
-        return tokens.view(temporal, self.patches, self.d_model)[-1].contiguous()
+        return self.encode_clips(clip.unsqueeze(0))[0]
 
 
 class NativeEncoder(Encoder, nn.Module):
@@ -103,13 +143,21 @@ class NativeEncoder(Encoder, nn.Module):
         self.tubelet = tubelet
 
     @torch.no_grad()
-    def encode_clip(self, clip: torch.Tensor) -> torch.Tensor:
-        pixels = clip.float().div_(255.0).permute(1, 0, 2, 3).unsqueeze(0)  # (1, 3, T, H, W)
+    def encode_clips(self, clips: torch.Tensor) -> list:
+        """(B, T, 3, H, W) uint8 -> B (P, D) token tensors, one batched conv3d call."""
+        check_clips(clips)
+        pixels = clips.float().div_(255.0).permute(0, 2, 1, 3, 4)   # (B, 3, T, H, W)
         if pixels.shape[2] % self.tubelet:
             pixels = pixels[:, :, : pixels.shape[2] - (pixels.shape[2] % self.tubelet)]
         stride = (self.tubelet, pixels.shape[3] // self.grid[0], pixels.shape[4] // self.grid[1])
         features = torch.nn.functional.conv3d(pixels, self.projection, stride=stride)
-        return features[0, :, -1].flatten(1).transpose(0, 1).contiguous()
+        # (B, D, T', gh, gw) -> last temporal position -> (B, P, D)
+        stacked = features[:, :, -1].flatten(2).transpose(1, 2).contiguous()
+        return list(stacked)
+
+    @torch.no_grad()
+    def encode_clip(self, clip: torch.Tensor) -> torch.Tensor:
+        return self.encode_clips(clip.unsqueeze(0))[0]
 
 
 def build_encoder(config: EncoderConfig, device: torch.device, allow_native: bool = False) -> Encoder:
