@@ -117,7 +117,25 @@ futures[2.0]["mu"], futures[2.0]["sigma"], futures[2.0]["target_time_seconds"]
 result = demo(model, encoder, config, "clips/a.mp4", device, "runs/predict",
               prefix_chunks=3, state_path=None)          # 等价于 CLI predict
 saved = query_saved_state(model, "state.pt", [1.0, 4.0], device, Path("runs/query"))
+
+# 可选解码：demo 与 query_saved_state 接受同一个 decoder 与它的 payload
+result = demo(model, encoder, config, "clips/a.mp4", device, "runs/predict_decoded",
+              prefix_chunks=3, decoder=decoder, decoder_payload=payload)
+result["decoded"]["predictions"]["records"]["h1"]        # 关键帧的元数据与 PNG 名
+result["target_frames"][1]                               # 对应的真值帧（只用于对照图）
+saved = query_saved_state(model, "state.pt", [1.0, 4.0], device, Path("runs/query_decoded"),
+                          decoder=decoder, decoder_payload=payload, config=config)
 ```
+
+解码是**可选**参数：不传 `decoder` 时 latent 产物与推理由此保持不变（`result["decoded"]`
+为 `None`），`predict_summary.json` / `state_query.json` 只多出 `decoded_rgb` 这一段附加
+元数据，未启用时为 `null`，既有键值不变。`query_saved_state` 在给了 `decoder` 却没给
+`out_dir` 时抛 `ValueError`（解码要写文件，不能静默忽略）；给了 `decoder` 还必须给
+`config`，因为兼容性检查需要编码器与采样身份。
+
+查询 Δ 保持 float64：`predict_at` 的键、`delta_seconds` 与 `target_time_seconds` 都是调用
+方给出的精确时间，`1.0` 与 `1.000000001` 是两个条目、两张不同文件名的图（只有激活值用
+float32）。
 
 - `stream_chunks` 与 `predict_at` 只处理 **batch 1** 的状态（内部取 `[0]`），并为每个
   分块产出一条日志：`skipped` 是被状态覆盖时的说明字符串（`"already covered by the
@@ -128,6 +146,66 @@ saved = query_saved_state(model, "state.pt", [1.0, 4.0], device, Path("runs/quer
   "meta": {...}}`，每个 horizon 只含 `mu`/`sigma`，有真值时含 `target`），把
   horizon、delta、时间戳与评分写入 `predict_summary.json`。
 - `predict_at` / `query_saved_state` 不需要视频与编码器。
+
+## 可选 RGB 解码器
+
+```python
+from wpm_video import (DecoderConfig, LatentRGBDecoder, build_decoder, decode_latents,
+                       load_decoder, run_decoder_training, evaluate_decoder,
+                       check_decoder_compatibility, ChunkFrameSource, alignment_record)
+
+decoder = build_decoder(config.decoder, model.patches, model.config.d_world)
+summary = run_decoder_training(config, "runs/run1/best.pt", Path("runs/decoder"), device)
+decoder, payload = load_decoder("runs/decoder/best.pt")   # 默认加载到 CPU
+decoder = decoder.to(device).eval()                       # 与 latent 同设备、推理模式
+
+latents = {"h1": mu[0]}                        # {"键": (P, d_world)}
+images = decode_latents(decoder, latents, device)      # {"h1": (3, S, S) float，[0, 1]}
+payload["path"]                                # 该 checkpoint 的绝对路径（加载时写入）
+```
+
+`decode_latents(decoder, latents, device)` 会把**解码器与 latent 都**移到 `device` 再推理
+（因此 CPU 上加载的解码器也能解码 GPU 上的 latent），并恢复调用前的 train/eval 模式；
+解码器之后留在该设备上，不会悄悄被移回。上面的 `.to(device)` 不是必需但更直观。
+
+| 调用 | 形状 / 类型 | 说明 |
+|---|---|---|
+| `build_decoder(config.decoder, patches, d_world)` | `LatentRGBDecoder` | 构建时即校验架构与网格；非法配置直接抛 `ValueError` |
+| `decoder(latents)` | `(B, P, d_world)` -> `(B, 3, S, S)` | 输入形状不对（`P`/`d_world`/维度）抛 `ValueError`；输出是 `[0, 1]` |
+| `decoder.parameter_count()` / `decoder.output_size` / `decoder.grid` | `int` / `int` / `(gh, gw)` | 参数量、输出边长、latent 网格 |
+| `decode_latents(decoder, {键: (P, d_world)}, device)` | `{键: (3, S, S)}` float `[0, 1]` | 把解码器与 latent 都移到 `device`，推理模式下运行并恢复原 mode；键可以是 horizon 或 Δ 秒 |
+| `render_latents(decoder, {键: (latent, meta)}, out_dir, device, payload=..., prefix=...)` | dict | 写 `<prefix>_<键>.png` 与 `frames` 张量；两个键映射到同一文件名时报错 |
+| `to_uint8(image)` / `save_frame_png(image, path)` | `(S, S, 3)` uint8 / 路径 | `[0,1]` float 三通道 RGB -> PNG（磁盘上是 BGR 字节序） |
+| `run_decoder_training(config, world_checkpoint, out_dir, device, resume="")` | dict | 见下 |
+| `evaluate_decoder(world_model, decoder, dataset, frame_source, config, device, batches, reference=None)` | dict | `l1`/`mse`/`psnr_db`/`per_video`；只读验证集，消耗零随机数 |
+| `load_decoder(path)` | `(LatentRGBDecoder, payload)` | 默认在 CPU 上构建；`payload["path"]` 是绝对路径；非解码器 checkpoint 或无 `schema_version` 时抛 `ValueError` |
+| `check_decoder_compatibility(payload, model, config, decoder=None)` | dict | 不匹配抛 `DecoderCompatibilityError`（`ValueError` 子类） |
+
+`run_decoder_training` 的输入是**世界模型 checkpoint 路径**，内部按顺序：加载并冻结世界
+模型 → 校验调用方 config 与 checkpoint 记录的编码器/采样身份一致 → （续训时）以
+checkpoint 架构为准 → 从 provenance 取划分并校验缓存、源视频与时间轴 → 训练。产物见
+[commands.md](commands.md#train-decoder)。`--resume` 恢复优化器、步数、两个采样生成器与
+CPU/CUDA 随机状态，因此续训与不中断的训练逐位一致。
+
+单位：像素指标是 `[0, 1]` 上的均值，`psnr_db = 10*log10(1/mse)`；时间一律为秒。解码产物
+中每张图都是**一个分块最后一帧**的关键帧，按 horizon/Δ 排列是阅读顺序，不是连续视频。
+细节见 [decoder.md](decoder.md)。
+
+## 目标帧与对齐
+
+```python
+from wpm_video import ChunkFrameSource, alignment_record
+source = ChunkFrameSource(config.data.video_dir, config.data, config.decoder.image_size,
+                          max_videos=config.decoder_train.frame_cache_videos)
+source.register(name, alignment_record(cache, require_identity=True))   # 训练路径
+frame, timestamp = source.target_frame(name, cache.chunks[index])       # (3,S,S) uint8, 秒
+```
+
+- 按视频惰性解码，最多同时在内存里保留 `max_videos` 条（LRU 淘汰）；训练路径必须先
+  `register`，`require_identity=True` 会拒绝缺少内容哈希/分块记录的缓存；
+- `target_frame` 用缓存 payload 里的 `end_frame - 1`（即该分块最后被采样的一帧），并断言
+  它的时间戳等于 `end_seconds - 1/source_fps`；源视频字节、采样栅格或分块边界与缓存不一致
+  时抛 `CacheAlignmentError`。
 
 ## 训练与评价
 

@@ -57,5 +57,30 @@
     "device": "cpu",
     "resume_from": "",
     "log_interval": 25
+  },
+  "decoder": {
+    "image_size": 64,
+    "base_channels": 16,
+    "channel_multipliers": [
+      1,
+      2
+    ],
+    "stem_blocks": 1,
+    "blocks_per_stage": 1
+  },
+  "decoder_train": {
+    "seed": 0,
+    "batch_windows": 4,
+    "learning_rate": 0.002,
+    "weight_decay": 0.0,
+    "max_steps": 100,
+    "grad_clip_norm": 5.0,
+    "eval_interval": 25,
+    "eval_batches": 2,
+    "log_interval": 10,
+    "max_wall_seconds": 600.0,
+    "l1_weight": 1.0,
+    "edge_weight": 0.1,
+    "frame_cache_videos": 2
   }
 }

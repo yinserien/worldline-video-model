@@ -3,6 +3,13 @@
 The PCA basis is fitted on training latents only, so a validation or demo point
 projected into it is not fitted on itself. The figures show latent geometry and
 prediction error; they are not generated pixels and are labelled as such.
+
+The one figure that does show pixels is ``plot_decoded_predictions``, and only when
+an optional decoder checkpoint is supplied. It keeps three things visually and
+textually apart: observed prefix frames, decoded keyframes (predicted and, on a
+separate row, the decoder's reconstruction of the true future latent), and the
+ground-truth future frame. Ordered horizons are separate keyframes, never a
+continuous video.
 """
 
 from pathlib import Path
@@ -77,8 +84,12 @@ def plot_uncertainty(predictions: dict, path: Path) -> None:
 
 
 def plot_frames(frames: torch.Tensor, prefix_end_frame: int, future_frame: int | None, path: Path,
-                times: list[float]) -> None:
-    """Observed prefix frames and the true future frame used as the prediction target."""
+                times: list[float], decoder_used: bool = False) -> None:
+    """Observed prefix frames and the true future frame used as the prediction target.
+
+    ``decoder_used`` only changes the caption: everything in this figure is real
+    video either way, and the default (no decoder) caption stays exactly as it was.
+    """
     count = min(6, frames.shape[0])
     indices = torch.linspace(0, max(prefix_end_frame - 1, 0), count).long().tolist()
     columns = count + (1 if future_frame is not None else 0)
@@ -92,8 +103,70 @@ def plot_frames(frames: torch.Tensor, prefix_end_frame: int, future_frame: int |
         axis.imshow(frames[future_frame].permute(1, 2, 0).numpy())
         axis.set_title("true future frame\n(ground truth reference)", fontsize=8)
         axis.axis("off")
-    figure.suptitle("observed prefix (left) and ground-truth target frame (right); no RGB is generated")
+    caption = "observed prefix (left) and ground-truth target frame (right); no RGB is generated"
+    if decoder_used:
+        caption += "\n(this figure is real video only; decoded keyframes are in decoded_frames.png)"
+    figure.suptitle(caption)
     figure.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=130)
+    plt.close(figure)
+
+
+def _titled_image(axis, image, title: str, times: tuple | None = None) -> None:
+    axis.imshow(image.permute(1, 2, 0).clamp(0, 1).numpy())
+    text = title
+    if times is not None:
+        text += f"\nΔ={times[0]:.1f}s  t={times[1]:.1f}s"
+    axis.set_title(text, fontsize=8)
+    axis.axis("off")
+
+
+def plot_decoded_predictions(result: dict, path: Path, prefix_frames: int = 2) -> None:
+    """Observed prefix, decoded keyframes and ground truth, kept visibly separate.
+
+    Rows: (1) observed prefix frames and the ground-truth target frame -- real video;
+    (2) decoded keyframes from the predicted latents, one per horizon; (3) the
+    decoder applied to the *true* future latent, which isolates decoder error from
+    prediction error. Only rows 2 and 3 are decoded RGB.
+    """
+    predictions = result["predictions"]
+    decoded = result.get("decoded") or {}
+    frames, prefix = result["frames"], result["prefix"]
+    horizons = sorted(predictions)
+    observed = min(prefix_frames, len(prefix))
+    columns = max(observed + 1, len(horizons))
+    figure, axes = plt.subplots(3, columns, figsize=(2.4 * columns, 8.0), squeeze=False)
+    for axis in axes.ravel():
+        axis.axis("off")
+    indices = torch.linspace(0, max(prefix[-1].end_frame - 1, 0), observed).long().tolist()
+    for column, index in enumerate(indices):
+        _titled_image(axes[0][column], frames[index].float() / 255.0,
+                      f"observed prefix\nt={float(result['timestamps'][index]):.1f}s")
+    target_frames = result.get("target_frames") or {}
+    ground_truth = (target_frames.get(horizons[-1]) if horizons else None)
+    if ground_truth is not None:
+        _titled_image(axes[0][-1], ground_truth.float() / 255.0,
+                      f"GROUND TRUTH frame\n(last sampled frame, {ground_truth.shape[-1]}px)")
+    for column, horizon in enumerate(horizons):
+        entry = predictions[horizon]
+        times = (entry["delta_seconds"], entry["target_time_seconds"])
+        image = (decoded.get("predictions") or {}).get("frames", {}).get(f"h{horizon}")
+        if image is not None:
+            _titled_image(axes[1][column], image,
+                          f"DECODED prediction (h{horizon}, {image.shape[-1]}px)", times)
+        reconstruction = (decoded.get("targets") or {}).get("frames", {}).get(f"h{horizon}")
+        if reconstruction is not None:
+            _titled_image(axes[2][column], reconstruction,
+                          f"DECODED true future latent (h{horizon})", times)
+    figure.suptitle(
+        "rows: observed prefix + ground truth (real video) / decoded keyframes from predicted "
+        "latents / decoder reconstruction of the true future latent\n"
+        "decoded frames are separate keyframes ordered by horizon, NOT a continuous video; "
+        "they are lossy reconstructions from frozen-encoder latents, not photorealistic output",
+        fontsize=9,
+    )
+    figure.tight_layout(rect=(0, 0, 1, 0.93))
     path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(path, dpi=130)
     plt.close(figure)

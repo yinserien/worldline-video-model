@@ -1,10 +1,12 @@
 # 配置
 
-配置是一个 JSON 文件。顶层只允许 `name`、`data`、`encoder`、`model`、`train`
-五个键，未知键会在加载时报错。
+配置是一个 JSON 文件。顶层只允许 `name`、`data`、`encoder`、`model`、`train`、
+`decoder`、`decoder_train` 七个键，未知键会在加载时报错。
 
 - **`data`、`encoder`、`model`、`train` 四个 section 必须存在**，`RunConfig.load`
   直接读取它们；只有 section 内部的字段可以省略并用默认值补齐。
+- `decoder` 与 `decoder_train` 是**可选**的（0.2.0 新增）：旧配置没有这两个 section
+  也能原样加载，取默认值，世界模型各命令的行为不变。`RunConfig.save` 会把它们写全。
 - `name` 可以省略，省略时为 `run`。
 
 生成一份包含全部默认值的配置：
@@ -111,10 +113,52 @@ config.validate()                        # load 时已自动调用
 `encoder.device` 与 `train.device` 各自生效：缓存用前者，训练/评价/推理用后者；
 `predict` 与 `query` 使用 `train.device`。
 
+## decoder
+
+可选 RGB 解码器的**架构**，只在 `train-decoder` 与传了 `--decoder-checkpoint` 的
+`predict`/`query` 里生效；不训练解码器时可以整段忽略。详见
+[decoder.md](decoder.md)。
+
+| 字段 | 默认值 | 约束 |
+|---|---|---|
+| `image_size` | `128` | 输出边长，`[32, 2048]` 且为 8 的倍数；另需是 patch 网格边长的 2 的幂倍（在构建时检查） |
+| `base_channels` | `128` | `[1, 2048]` |
+| `channel_multipliers` | `[1, 2, 2]` | 非空，每项为 `[1, 64]` 的整数 |
+| `stem_blocks` | `2` | 整数 `>= 1`，网格分辨率上的卷积层数 |
+| `blocks_per_stage` | `1` | 整数 `>= 1`，每次上采样后的卷积层数 |
+
+## decoder_train
+
+解码器的优化设置（`train-decoder` 使用），与世界模型的 `train` 相互独立。
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `seed` | `0` | 非负整数；在**构建解码器之前**生效，保证 initial checkpoint 与续训一致 |
+| `batch_windows` | `8` | 每步窗口数（训练与验证共用） |
+| `learning_rate` | `0.0003` | AdamW 学习率，正有限 |
+| `weight_decay` | `0.0` | 有限非负 |
+| `max_steps` | `2000` | **总目标步数**；续训时要大于 checkpoint 的 step |
+| `grad_clip_norm` | `5.0` | 梯度裁剪范数，正有限 |
+| `eval_interval` | `100` | 验证间隔（步） |
+| `eval_batches` | `4` | 每次验证的 batch 数 |
+| `log_interval` | `25` | 日志间隔（步） |
+| `max_wall_seconds` | `1800.0` | 墙钟上限；到点会先对最终 checkpoint 补一次验证 |
+| `l1_weight` | `1.0` | 像素 L1 权重，有限非负 |
+| `edge_weight` | `0.1` | 边缘（有限差分 L1）权重，`0` 关闭；与 `l1_weight` 不能同时为 0 |
+| `frame_cache_videos` | `2` | 目标帧按视频惰性解码，最多同时在内存里保留几条 |
+
+世界模型训练写出的 `config.json` 里包含这两段，因此把同一份配置交给
+`train-decoder` 时，采样参数与编码器身份天然一致。
+
 ## 检查点与状态
 
-checkpoint（`initial.pt` / `best.pt` / `final.pt`）保存：模型与配置、投影与标准化
-buffer、优化器、步数、采样器与 CPU/CUDA 随机状态、训练 provenance。
+世界模型的 checkpoint（`initial.pt` / `best.pt` / `final.pt`）保存：模型与配置、投影与
+标准化 buffer、优化器、步数、采样器与 CPU/CUDA 随机状态、训练 provenance。
+
+解码器的 checkpoint 名字相同但内容不同（`kind="rgb_decoder"`）：解码器配置与架构、
+**world 投影 buffer 的 SHA-256 指纹**、编码器身份、采样参数、目标帧语义与分辨率、
+优化器、步数、两个采样生成器与 CPU/CUDA 随机状态。给 `--decoder-checkpoint` 传世界模型
+checkpoint 会被明确拒绝。见 [decoder.md](decoder.md)。
 
 - 用 `--resume <checkpoint>` 继续训练：恢复优化器与随机状态，沿用配置里的数据划分，
   `max_steps` 为总目标步数。`initial.pt` 只在新训练时写出，`best.pt` 只在验证指标
@@ -143,3 +187,11 @@ buffer、优化器、步数、采样器与 CPU/CUDA 随机状态、训练 proven
 `predict` 的输出里 `latent_pca.png` 是**可选**可视化：仅用训练集 latent 拟合，
 绝不使用推理视频。当 checkpoint 没有训练划分信息，或本机没有对应的 token 缓存时，
 会跳过并在 `pca_meta.json` 记录 `status` 与 `reason`；其余产物不受影响。
+
+## 可选 RGB 解码
+
+`--decoder-checkpoint` 是**可选**的：不传时 `predict`/`query` 只产出 latent 与既有的
+非 RGB 图表，`predict_summary.json` 的 `decoded_rgb` 为 `null`。传了以后才会多出
+`decoded_*.png` 等关键帧产物；解码器与 world checkpoint 的身份不匹配时，在写出任何图片
+之前就会报错。字段、指纹与产物见 [decoder.md](decoder.md) 与
+[commands.md](commands.md#predict)。

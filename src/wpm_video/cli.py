@@ -13,16 +13,19 @@ import time
 import torch
 
 from . import __version__
-from .config import RunConfig
+from .config import DecoderConfig, RunConfig
 from .data import PUBLIC_DATASET, build_source_manifest, list_videos, load_source_manifest
 from .dataset import TokenDataset, cache_video_tokens, prepare_split_lists
+from .decoder.compat import check_decoder_compatibility
+from .decoder.model import load_decoder
+from .decoder.train import run_decoder_training
 from .encoder import cache_path
 from .encoder import build_encoder
 from .evaluate import baseline_summary, compare, evaluate_baselines, fit_baseline_stats
 from .model import VideoWorldModel
 from .predict import demo, query_saved_state
 from .train import build_model, evaluate_model, fit_projection, source_signature, train
-from .viz import fit_pca, plot_frames, plot_future_pca, plot_uncertainty
+from .viz import fit_pca, plot_decoded_predictions, plot_frames, plot_future_pca, plot_uncertainty
 
 
 def load_config(path: Path) -> RunConfig:
@@ -45,6 +48,25 @@ def write_json(path: Path, payload) -> None:
 def _load_model(path: Path, device):
     model, payload = VideoWorldModel.from_checkpoint(path, map_location="cpu")
     return model.to(device), payload
+
+
+def _load_optional_decoder(args, model, config: RunConfig, device):
+    """Load ``--decoder-checkpoint`` and verify it against this world model.
+
+    Returns ``(decoder, payload)`` or ``(None, None)``. The compatibility check runs
+    here, before the video is touched, so an incompatible decoder fails without
+    producing half-labelled images.
+    """
+    path = getattr(args, "decoder_checkpoint", None)
+    if not path:
+        return None, None
+    decoder, payload = load_decoder(Path(path), map_location="cpu")
+    check_decoder_compatibility(payload, model, config, decoder)
+    if int(config.decoder.image_size) != int(decoder.config.image_size):
+        print(f"note: the decoder checkpoint outputs {decoder.config.image_size}px; "
+              f"config.decoder.image_size ({config.decoder.image_size}) only applies to training",
+              flush=True)
+    return decoder.to(device), payload
 
 
 def _splits(config: RunConfig, args) -> dict:
@@ -245,15 +267,20 @@ def command_predict(args, config: RunConfig) -> int:
     device = resolve_device(config.train.device)
     model, payload = _load_model(Path(args.checkpoint), device)
     model.checkpoint_provenance = payload.get("provenance") or {}
+    decoder, decoder_payload = _load_optional_decoder(args, model, config, device)
     encoder = build_encoder(config.encoder, device, allow_native=args.allow_native)
     out_dir = Path(args.out or "runs/predict")
     result = demo(model, encoder, config, Path(args.video), device, out_dir,
                   prefix_chunks=args.prefix_chunks,
-                  state_path=Path(args.state) if args.state else None)
+                  state_path=Path(args.state) if args.state else None,
+                  decoder=decoder, decoder_payload=decoder_payload)
     plot_uncertainty(result["predictions"], out_dir / "uncertainty.png")
     plot_frames(result["frames"], result["prefix"][-1].end_frame,
                 result["future"][0].start_frame if result["future"] else None,
-                out_dir / "frames.png", [float(t) for t in result["timestamps"]])
+                out_dir / "frames.png", [float(t) for t in result["timestamps"]],
+                decoder_used=decoder is not None)
+    if decoder is not None:
+        plot_decoded_predictions(result, out_dir / "decoded_frames.png")
     latents, skipped_reason = optional_train_latents(model, config, device)
     pca_meta = {"fitted_on": "train split only", "optional": True,
                 "checkpoint_has_provenance": bool(model.checkpoint_provenance)}
@@ -275,9 +302,38 @@ def command_query(args, config: RunConfig) -> int:
     """State-only future query: no video, no encoder, no ground truth."""
     device = resolve_device(config.train.device)
     model, _ = _load_model(Path(args.checkpoint), device)
+    decoder, decoder_payload = _load_optional_decoder(args, model, config, device)
     out_dir = Path(args.out or "runs/query")
-    result = query_saved_state(model, Path(args.state), args.deltas, device, out_dir)
+    result = query_saved_state(model, Path(args.state), args.deltas, device, out_dir,
+                               decoder=decoder, decoder_payload=decoder_payload, config=config)
     print(json.dumps(result["summary"], indent=2, default=float))
+    return 0
+
+
+def command_train_decoder(args, config: RunConfig) -> int:
+    """Train the optional RGB decoder against a frozen world checkpoint.
+
+    The encoder and the world model are never touched: inputs come from the token
+    cache, targets from the source videos, and the split from the checkpoint's
+    provenance. Only ``--checkpoint`` and the cache/videos it refers to are needed.
+    """
+    device = resolve_device(config.train.device)
+    checkpoint = Path(args.checkpoint)
+    out_dir = Path(args.out or "runs/decoder")
+    # the run directory is created by the training call itself, so a rejected
+    # checkpoint does not leave an empty directory behind
+    summary = run_decoder_training(config, checkpoint, out_dir, device, resume=args.resume or "")
+    splits = summary.get("splits") or {}
+    # write what was actually trained with: the split recovered from the world
+    # checkpoint and the decoder architecture that ran (authoritative on resume)
+    if summary.get("decoder_config"):
+        config.decoder = DecoderConfig(**summary["decoder_config"])
+    config.data.train_videos = list(splits.get("train") or config.data.train_videos)
+    config.data.val_videos = list(splits.get("val") or config.data.val_videos)
+    config.save(out_dir / "config.json")
+    write_json(out_dir / "splits.json", splits)
+    print(json.dumps({key: value for key, value in summary.items() if key != "provenance"},
+                     indent=2, default=float))
     return 0
 
 
@@ -317,7 +373,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wpm-video", description=__doc__.splitlines()[0])
     parser.add_argument("--version", action="version", version=f"wpm-video {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("cache", "train", "eval", "predict", "query", "provenance", "selfcheck"):
+    for name in ("cache", "train", "train-decoder", "eval", "predict", "query", "provenance",
+                 "selfcheck"):
         item = sub.add_parser(name)
         item.add_argument("--config", required=True, type=Path)
         item.add_argument("--out", type=Path, default=None)
@@ -329,6 +386,11 @@ def build_parser() -> argparse.ArgumentParser:
             item.add_argument("--resume", type=Path, default=None)
             item.add_argument("--train-videos", nargs="*", default=None)
             item.add_argument("--val-videos", nargs="*", default=None)
+        if name == "train-decoder":
+            item.add_argument("--checkpoint", required=True, type=Path,
+                              help="world model checkpoint (frozen); its provenance defines the split")
+            item.add_argument("--resume", type=Path, default=None,
+                              help="continue decoder training (restores optimizer, step and RNG)")
         if name == "eval":
             item.add_argument("--checkpoint", required=True, type=Path)
             item.add_argument("--checkpoints", nargs="*", type=Path, default=None)
@@ -339,10 +401,14 @@ def build_parser() -> argparse.ArgumentParser:
             item.add_argument("--prefix-chunks", type=int, default=3)
             item.add_argument("--state", type=Path, default=None,
                               help="continue from a saved persistent state")
+            item.add_argument("--decoder-checkpoint", type=Path, default=None,
+                              help="optional RGB decoder: also write decoded keyframe PNGs")
         if name == "query":
             item.add_argument("--checkpoint", required=True, type=Path)
             item.add_argument("--state", required=True, type=Path)
             item.add_argument("--deltas", nargs="*", type=float, default=[1.0, 2.0, 4.0])
+            item.add_argument("--decoder-checkpoint", type=Path, default=None,
+                              help="optional RGB decoder: also write decoded keyframe PNGs")
         if name == "provenance":
             item.add_argument("--revision", type=str, default=None)
             item.add_argument("--snapshot", type=Path, default=None)
@@ -353,8 +419,8 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     config = load_config(args.config)
     commands = {
-        "cache": command_cache, "train": command_train, "eval": command_eval,
-        "predict": command_predict, "query": command_query,
+        "cache": command_cache, "train": command_train, "train-decoder": command_train_decoder,
+        "eval": command_eval, "predict": command_predict, "query": command_query,
         "provenance": command_provenance, "selfcheck": command_selfcheck,
     }
     try:

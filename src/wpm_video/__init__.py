@@ -9,12 +9,24 @@ writes observations through a Gaussian innovation, advances the state by real ti
 without observations, and predicts distributions over future spatial latents of a
 frozen encoder. See README.md and docs/ for usage.
 
+An *optional* RGB decoder (``wpm_video.decoder``) can turn those latents into
+keyframe images. It is trained separately against a frozen world checkpoint, is
+never part of the dynamics, and is only used when a decoder checkpoint is given
+explicitly. Decoded images are lossy reconstructions of one keyframe per chunk,
+not generated video; see docs/decoder.md.
+
 """
-from .config import DataConfig, EncoderConfig, ModelConfig, RunConfig, TrainConfig
+from .config import (DataConfig, DecoderConfig, DecoderTrainConfig, EncoderConfig, ModelConfig,
+                     RunConfig, TrainConfig, decoder_architecture, validate_decoder_config)
 from .data import (Chunk, VideoInfo, build_chunks, build_source_manifest, list_videos,
                    load_source_manifest, probe_video, read_frames, resolve_source)
 from .dataset import (TIMELINE_SCHEMA, TokenDataset, Window, WindowSampler, cache_video_tokens,
                       check_split_integrity, gather_batch)
+from .decoder import (ChunkFrameSource, DecoderCompatibilityError, LatentRGBDecoder,
+                      TARGET_SEMANTICS, alignment_record, build_decoder,
+                      check_decoder_compatibility, check_world_preprocessing, decode_latents,
+                      evaluate_decoder, load_decoder, projection_fingerprint, render_latents,
+                      run_decoder_training, save_decoder, train_decoder)
 from .encoder import NativeEncoder, VJEPA2Encoder, build_encoder, cache_identity, cache_path
 from .evaluate import (BASELINES, baseline_summary, compare, evaluate_baselines,
                        fit_baseline_stats, iter_windows)
@@ -25,15 +37,20 @@ from .train import (build_model, evaluate_model, fit_projection, rng_restore, rn
                     set_determinism, source_signature, train)
 from .world_state import WorldState
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
-    "DataConfig", "EncoderConfig", "ModelConfig", "RunConfig", "TrainConfig",
+    "DataConfig", "DecoderConfig", "DecoderTrainConfig", "EncoderConfig", "ModelConfig",
+    "RunConfig", "TrainConfig", "decoder_architecture", "validate_decoder_config",
     "Chunk", "VideoInfo", "build_chunks", "list_videos", "probe_video", "read_frames",
     "build_source_manifest", "load_source_manifest", "resolve_source",
     "TIMELINE_SCHEMA", "TokenDataset", "Window", "WindowSampler", "cache_video_tokens",
     "check_split_integrity", "gather_batch",
+    "ChunkFrameSource", "DecoderCompatibilityError", "LatentRGBDecoder", "TARGET_SEMANTICS",
+    "alignment_record", "build_decoder", "check_decoder_compatibility", "check_world_preprocessing",
+    "decode_latents", "evaluate_decoder", "load_decoder", "projection_fingerprint",
+    "render_latents", "run_decoder_training", "save_decoder", "train_decoder",
     "NativeEncoder", "VJEPA2Encoder", "build_encoder", "cache_path", "cache_identity",
     "BASELINES", "baseline_summary", "compare", "evaluate_baselines", "fit_baseline_stats",
     "iter_windows",

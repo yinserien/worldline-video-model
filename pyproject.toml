@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "worldline-video-model"
-version = "0.1.0"
-description = "Persistent-state video world model over frozen video-encoder latents"
+version = "0.2.0"
+description = "Persistent-state video world model over frozen video-encoder latents, with an optional latent-to-RGB decoder"
 readme = "README.md"
 requires-python = ">=3.10"
-keywords = ["world model", "video", "JEPA", "latent dynamics", "state-space"]
+keywords = ["world model", "video", "JEPA", "latent dynamics", "state-space", "decoder"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",

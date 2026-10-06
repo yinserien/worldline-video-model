@@ -57,5 +57,31 @@
     "device": "cuda",
     "resume_from": "",
     "log_interval": 25
+  },
+  "decoder": {
+    "image_size": 128,
+    "base_channels": 128,
+    "channel_multipliers": [
+      1,
+      2,
+      2
+    ],
+    "stem_blocks": 2,
+    "blocks_per_stage": 1
+  },
+  "decoder_train": {
+    "seed": 0,
+    "batch_windows": 8,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0,
+    "max_steps": 2000,
+    "grad_clip_norm": 5.0,
+    "eval_interval": 100,
+    "eval_batches": 4,
+    "log_interval": 25,
+    "max_wall_seconds": 1800.0,
+    "l1_weight": 1.0,
+    "edge_weight": 0.1,
+    "frame_cache_videos": 2
   }
 }

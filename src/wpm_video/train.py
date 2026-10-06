@@ -33,13 +33,15 @@ from .world_state import WorldState
 def source_signature(package: Path | None = None) -> str:
     """Hash of the installed package sources, so a run records which code produced it.
 
-    Defaults to the directory this module was imported from, which works for a
-    wheel install where no ``src/`` tree exists.
+    Recursive, so subpackages (``wpm_video/decoder``) are part of the signature and
+    a decoder training run records the decoder code that produced it. Defaults to the
+    directory this module was imported from, which works for a wheel install where no
+    ``src/`` tree exists.
     """
     directory = Path(package) if package is not None else Path(__file__).resolve().parent
     digest = hashlib.sha256()
-    for path in sorted(directory.glob("*.py")):
-        digest.update(path.name.encode())
+    for path in sorted(directory.rglob("*.py")):
+        digest.update(path.relative_to(directory).as_posix().encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()
 

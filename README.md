@@ -1,8 +1,15 @@
 # worldline-video-model
 
 提供视频编码缓存、训练、流式预测与状态查询：按因果分块读取视频，在块之间保持一个
-持久状态，并按真实时间预测未来时刻的表征分布。预测输出为 latent 的均值与标准差，
-不生成 RGB。包内不包含权重与视频。
+持久状态，并按真实时间预测未来时刻的表征分布。预测输出为 latent 的均值与标准差。
+包内不包含权重与视频。
+
+另有一个**可选**的 RGB 解码器：它把一个分块的投影后 latent 还原成该分块**最后一帧**的
+关键帧图片，需要单独训练（`train-decoder`）并显式传入（`--decoder-checkpoint`）才会
+生效。它不是视频生成器：输出是有损重建（可能发虚、缺纹理），按 horizon 排列的多张图是
+彼此独立的关键帧而非连续视频。不传解码器时，latent 产物与推理行为保持兼容：既有文件的
+内容不变，`predict_summary.json` / `state_query.json` 只新增 `decoded_rgb` 附加字段
+（未启用时为 `null`）。详见 [docs/decoder.md](docs/decoder.md)。
 
 ## 安装
 
@@ -13,7 +20,7 @@
 # 1) 包外环境（可复用已有的 torch，避免重复下载）
 python -m venv --system-site-packages E:\work\wpm_env
 # 2) 安装发行包
-& "E:\work\wpm_env\Scripts\python.exe" -m pip install "E:\path\to\worldline_video_model-0.1.0-py3-none-any.whl"
+& "E:\work\wpm_env\Scripts\python.exe" -m pip install "E:\path\to\worldline_video_model-0.2.0-py3-none-any.whl"
 # 3) 校验（用解释器全路径，不依赖 PATH）
 & "E:\work\wpm_env\Scripts\python.exe" -m wpm_video --version
 ```
@@ -22,7 +29,7 @@ Linux / macOS：
 
 ```bash
 python -m venv --system-site-packages ~/wpm_env
-~/wpm_env/bin/python -m pip install "/path/to/worldline_video_model-0.1.0-py3-none-any.whl"
+~/wpm_env/bin/python -m pip install "/path/to/worldline_video_model-0.2.0-py3-none-any.whl"
 ~/wpm_env/bin/python -m wpm_video --version
 ```
 
@@ -30,7 +37,7 @@ python -m venv --system-site-packages ~/wpm_env
   （构建过程中源码目录里会出现构建中间产物）。
 - 只用 native 编码器（合成视频、CPU）时，上面的安装就够了。
 - 需要真实 V-JEPA 2 编码器时，再安装可选依赖：安装 wheel 时写成
-  `"E:\path\to\worldline_video_model-0.1.0-py3-none-any.whl[vjepa]"`，或单独执行
+  `"E:\path\to\worldline_video_model-0.2.0-py3-none-any.whl[vjepa]"`，或单独执行
   `pip install "transformers>=5.15,<6" huggingface_hub`。
 - 本页后续命令统一写作 `& $py -m wpm_video`，其中 `$py` 是解释器全路径
   （`&` 是 PowerShell 调用运算符，省略它无法执行变量里的命令）。激活环境后也可以用
@@ -64,15 +71,18 @@ $py = "E:\work\wpm_env\Scripts\python.exe"
 
 示例脚本随源码发行包提供（wheel 内不含 `examples/`）。用随机初始化的 native 编码器
 和脚本现场生成的合成视频跑完整链路（cache → train → 新进程 resume → eval →
-predict → query），不需要 GPU 和任何下载：
+predict → query → train-decoder → 带解码的 predict/query），不需要 GPU 和任何下载：
 
 ```powershell
 Set-Location E:\work\wpm_run
 $py = "E:\work\wpm_env\Scripts\python.exe"
-& $py "E:\path\to\sdist\examples\native_end_to_end.py" --out E:\work\wpm_run\native_demo --steps 40
+& $py "E:\path\to\sdist\examples\native_end_to_end.py" --out E:\work\wpm_run\native_demo --steps 40 --decoder-steps 60
 ```
 
-输入是合成视频、编码器是随机权重，该示例只用来确认安装与链路可用。
+输入是合成视频、编码器是随机权重，该示例只用来确认安装与链路可用：它会打印解码器在
+留出视频上的 `l1`/`mse`/`psnr`，并写出 `decoded_h1.png`（预测 latent 解码）与
+`target_reconstruction_h1.png`（真值 latent 解码）等关键帧。脚本只在 `--out` 与一个
+临时目录里写文件，不会在包目录内生成任何东西。
 
 ## 用自己的视频
 
@@ -105,6 +115,28 @@ $videoPath = Join-Path $config.data.video_dir ($splits.val[0] + ".mp4")
 & $py -m wpm_video query --config config.json --checkpoint runs\run1\best.pt `
     --state runs\predict\world_state.pt --deltas 1 2 4 8 --out runs\query
 ```
+
+想要图片时再训练可选解码器（划分直接取自 world checkpoint，不需要额外参数）：
+
+```powershell
+Set-Location E:\work\wpm_run
+$py = "E:\work\wpm_env\Scripts\python.exe"
+
+# 7) 训练 RGB 解码器：编码器与世界模型冻结，输入是缓存 latent，目标是分块最后一帧
+& $py -m wpm_video train-decoder --config config.json --checkpoint runs\run1\best.pt --out runs\decoder
+
+# 8) 带解码的预测与查询：多出 decoded_*.png 关键帧
+& $py -m wpm_video predict --config config.json --checkpoint runs\run1\best.pt `
+    --video $videoPath --out runs\predict_decoded --prefix-chunks 3 `
+    --decoder-checkpoint runs\decoder\best.pt
+& $py -m wpm_video query --config config.json --checkpoint runs\run1\best.pt `
+    --state runs\predict\world_state.pt --deltas 1 2 4 8 --out runs\query_decoded `
+    --decoder-checkpoint runs\decoder\best.pt
+```
+
+解码器与 world checkpoint 的投影、编码器身份和采样参数必须匹配，否则会在写出任何图片
+之前报错。`.pt` 解码器 checkpoint 只认本包训练出来的架构与 schema。详见
+[docs/decoder.md](docs/decoder.md)。
 
 继续训练时**沿用上一个 run 的 `config.json`**（它记录了真实的 train/val 划分），
 并把 `max_steps` 调到大于 checkpoint 的 step，否则不会继续训练：
@@ -148,17 +180,28 @@ state.save("state.pt")                                   # 状态可跨进程保
 
 futures = predict_at(model, state, [1.0, 2.0, 4.0])      # 只用 state 与时间查询
 mean, sigma = futures[2.0]["mu"], futures[2.0]["sigma"]  # 形状 (patches, d_world)
+
+# 可选：训练一次解码器，之后把 latent 还原成关键帧
+from wpm_video import build_decoder, decode_latents, load_decoder, run_decoder_training
+run_decoder_training(config, "runs/run1/best.pt", Path("runs/decoder"), device)
+decoder, decoder_payload = load_decoder("runs/decoder/best.pt")   # 默认加载到 CPU
+decoder = decoder.to(device).eval()                               # 与 latent 同设备，推理模式
+images = decode_latents(decoder, {2.0: futures[2.0]["mu"]}, device)   # {2.0: (3, S, S) ∈ [0,1]}
 ```
+
+`decode_latents` 也会把解码器移到 `device` 再推理（并恢复调用前的模式），所以上面的
+`.to(device)` 不是必需的，但显式写出来更容易读。
 
 其中 `stream_chunks`、`predict_at` 只处理 batch 1 的状态；底层的
 `model.observe` / `model.predict` 支持 batched 状态。完整 API、张量形状与路径参数
-类型见 [docs/api.md](docs/api.md)。
+类型见 [docs/api.md](docs/api.md)，解码器见 [docs/decoder.md](docs/decoder.md)。
 
 ## 使用文档
 
 - [docs/configuration.md](docs/configuration.md)：配置字段、默认值、约束与路径规则
 - [docs/commands.md](docs/commands.md)：CLI 命令、参数与输出文件
 - [docs/api.md](docs/api.md)：Python API 与张量形状、单位
+- [docs/decoder.md](docs/decoder.md)：可选 RGB 解码器的架构、训练、兼容性与已知限制
 - [examples/prepare_sample_dataset.md](examples/prepare_sample_dataset.md)：公开样例片段下载与来源校验
 
 ## 目录
@@ -166,8 +209,9 @@ mean, sigma = futures[2.0]["mu"], futures[2.0]["sigma"]  # 形状 (patches, d_wo
 ```
 src/wpm_video/   包源码（config data dataset encoder model world_state train evaluate
                  predict viz selfcheck cli __main__）
+src/wpm_video/decoder/  可选 RGB 解码器（model compat targets train render）
 configs/         vjepa2_256.json（真实编码器）、native_tiny.json（CPU，无下载）
 examples/        无下载全链路示例、公开样例数据准备
-tests/           架构契约、端到端流水线、CLI 与来源校验
+tests/           架构契约、端到端流水线、CLI 与来源校验、解码器
 docs/            使用文档
 ```

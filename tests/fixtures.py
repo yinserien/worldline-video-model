@@ -10,7 +10,8 @@ import cv2
 import numpy as np
 import torch
 
-from wpm_video.config import DataConfig, EncoderConfig, ModelConfig, RunConfig, TrainConfig
+from wpm_video.config import (DataConfig, DecoderConfig, DecoderTrainConfig, EncoderConfig,
+                              ModelConfig, RunConfig, TrainConfig)
 
 FRAMES, SIZE, FPS = 16, 64, 8.0
 
@@ -50,6 +51,31 @@ def tiny_config(train_videos, val_videos, steps: int = 6, seed: int = 0) -> RunC
         train=TrainConfig(seed=seed, batch_windows=2, max_steps=steps, eval_interval=3,
                           eval_batches=1, device="cpu", log_interval=1, max_wall_seconds=600.0),
     )
+
+
+def tiny_decoder_config(train_videos, val_videos, steps: int = 60, seed: int = 0,
+                        image_size: int = SIZE) -> RunConfig:
+    """The tiny native configuration plus a small RGB decoder.
+
+    The decoder stays deliberately small (16 base channels, a 4x4 patch grid) so a
+    whole train/evaluate/resume cycle runs on CPU in seconds; the *default*
+    configuration is the ~1.5M parameter one tested separately.
+    """
+    config = tiny_config(train_videos, val_videos, seed=seed)
+    config.decoder = DecoderConfig(image_size=image_size, base_channels=16,
+                                   channel_multipliers=[1, 2], stem_blocks=1, blocks_per_stage=1)
+    config.decoder_train = DecoderTrainConfig(seed=seed, batch_windows=2, learning_rate=2e-3,
+                                              max_steps=steps, eval_interval=steps, eval_batches=1,
+                                              log_interval=1, max_wall_seconds=600.0,
+                                              frame_cache_videos=2)
+    config.validate()
+    return config
+
+
+def tiny_decoder(config):
+    """Decoder module matching :func:`tiny_decoder_config` for a 4x4 patch grid."""
+    from wpm_video.decoder import build_decoder
+    return build_decoder(config.decoder, patches=16, d_world=config.model.d_world)
 
 
 def native_encoder(d_model: int = 48, seed: int = 5):

@@ -1,9 +1,14 @@
-"""Run configuration: data, encoder, model and training settings.
+"""Run configuration: data, encoder, model, training and optional decoder settings.
 
 Plain dataclasses with JSON round-tripping plus strict validation. Every field
 here is used by the implementation, and ``validate`` refuses combinations that
 would silently change the meaning of a run (bad dimensions, illegal horizons,
 overlapping splits, unstable integration).
+
+The ``decoder`` and ``decoder_train`` sections configure the *optional* RGB
+decoder. They are absent from every configuration written before the decoder
+existed and default to valid values, so an old ``config.json`` loads unchanged
+and the world-model commands behave exactly as before.
 """
 
 from dataclasses import asdict, dataclass, field
@@ -89,12 +94,55 @@ class TrainConfig:
 
 
 @dataclass
+class DecoderConfig:
+    """Architecture of the optional RGB decoder.
+
+    The decoder maps projected world latents ``(B, P, d_world)`` of one chunk,
+    with their 2D patch layout, to one RGB keyframe ``(B, 3, image_size,
+    image_size)`` in ``[0, 1]``. It is trained separately from the world model
+    (see :class:`DecoderTrainConfig`) and is never part of the dynamics.
+
+    ``image_size`` is the output edge; the patch grid comes from the world
+    checkpoint, and ``image_size / grid_side`` must be a power of two so the
+    upsampling stages are exact. Defaults are a compact ~1.5M parameter network
+    at a 16x16 patch grid and a 128 pixel output.
+    """
+
+    image_size: int = 128
+    base_channels: int = 128
+    channel_multipliers: list = field(default_factory=lambda: [1, 2, 2])
+    stem_blocks: int = 2         # convolutions at patch-grid resolution
+    blocks_per_stage: int = 1    # convolutions after each x2 upsample
+
+
+@dataclass
+class DecoderTrainConfig:
+    """Optimisation settings for the separate decoder training path."""
+
+    seed: int = 0
+    batch_windows: int = 8
+    learning_rate: float = 3e-4
+    weight_decay: float = 0.0
+    max_steps: int = 2000
+    grad_clip_norm: float = 5.0
+    eval_interval: int = 100
+    eval_batches: int = 4
+    log_interval: int = 25
+    max_wall_seconds: float = 1800.0
+    l1_weight: float = 1.0
+    edge_weight: float = 0.1     # small finite-difference edge term; 0 disables it
+    frame_cache_videos: int = 2  # per-video RGB frames held in RAM at most
+
+
+@dataclass
 class RunConfig:
     name: str = "run"
     data: DataConfig = field(default_factory=DataConfig)
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+    decoder: DecoderConfig = field(default_factory=DecoderConfig)
+    decoder_train: DecoderTrainConfig = field(default_factory=DecoderTrainConfig)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -187,6 +235,17 @@ class RunConfig:
                 raise ValueError(f"train and validation videos overlap: {sorted(overlap)}")
             if not data.train_videos or not data.val_videos:
                 raise ValueError("both train_videos and val_videos must be given, or neither")
+        self.validate_decoder()
+
+    def validate_decoder(self) -> None:
+        """Decoder sections, checked even when no decoder is trained.
+
+        Delegates to :func:`validate_decoder_config`, which is also called by the
+        decoder module itself, so the direct API (``build_decoder``/``load_decoder``)
+        enforces the same rules as a configuration file.
+        """
+        validate_decoder_config(self.decoder, self.decoder_train)
+
 
     def save(self, path) -> None:
         path = Path(path)  # accepts str or Path
@@ -197,16 +256,86 @@ class RunConfig:
     def load(cls, path) -> "RunConfig":
         path = Path(path)
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        known = {"name", "data", "encoder", "model", "train"}
+        known = {"name", "data", "encoder", "model", "train", "decoder", "decoder_train"}
         unknown = set(payload) - known
         if unknown:
             raise ValueError(f"Unknown configuration sections: {sorted(unknown)}")
+        # decoder sections are optional: a config written before the decoder existed
+        # loads unchanged and keeps the behaviour of the world-model commands
         config = cls(
             name=payload.get("name", "run"),
             data=DataConfig(**payload["data"]),
             encoder=EncoderConfig(**payload["encoder"]),
             model=ModelConfig(**payload["model"]),
             train=TrainConfig(**payload["train"]),
+            decoder=DecoderConfig(**payload.get("decoder", {})),
+            decoder_train=DecoderTrainConfig(**payload.get("decoder_train", {})),
         )
         config.validate()
         return config
+
+
+def validate_decoder_config(decoder: DecoderConfig,
+                            settings: "DecoderTrainConfig | None" = None) -> None:
+    """Architecture (and optionally optimiser) rules for the RGB decoder.
+
+    Called by ``RunConfig.validate`` and by the decoder module itself, so the direct
+    API (``build_decoder``/``load_decoder``) enforces the same rules as a
+    configuration file. The grid-relative check (``image_size`` divided by the patch
+    grid must be a power of two) needs the encoder's patch count, so it runs in
+    ``build_decoder`` instead.
+    """
+    if type(decoder.image_size) is not int or not 32 <= decoder.image_size <= 2048:
+        raise ValueError("decoder.image_size must be an integer in [32, 2048]")
+    if decoder.image_size % 8:
+        raise ValueError("decoder.image_size must be a multiple of 8")
+    if type(decoder.base_channels) is not int or not 1 <= decoder.base_channels <= 2048:
+        raise ValueError("decoder.base_channels must be an integer in [1, 2048]")
+    if not decoder.channel_multipliers:
+        raise ValueError("decoder.channel_multipliers must not be empty")
+    for multiplier in decoder.channel_multipliers:
+        if type(multiplier) is not int or not 1 <= multiplier <= 64:
+            raise ValueError(
+                f"decoder.channel_multipliers entries must be integers in [1, 64], got {multiplier!r}"
+            )
+    for name in ("stem_blocks", "blocks_per_stage"):
+        value = getattr(decoder, name)
+        if type(value) is not int or value < 1:
+            raise ValueError(f"decoder.{name} must be an integer >= 1")
+    if settings is None:
+        return
+    if type(settings.seed) is not int or settings.seed < 0:
+        raise ValueError("decoder_train.seed must be a non-negative integer")
+    for name in ("batch_windows", "max_steps", "eval_interval", "eval_batches", "log_interval",
+                 "frame_cache_videos"):
+        value = getattr(settings, name)
+        if type(value) is not int or value < 1:
+            raise ValueError(f"decoder_train.{name} must be an integer >= 1")
+    for name in ("learning_rate", "grad_clip_norm", "max_wall_seconds"):
+        value = getattr(settings, name)
+        if not (math.isfinite(value) and value > 0):
+            raise ValueError(f"decoder_train.{name} must be positive and finite")
+    if not (math.isfinite(settings.weight_decay) and settings.weight_decay >= 0):
+        raise ValueError("decoder_train.weight_decay must be finite and non-negative")
+    for name in ("l1_weight", "edge_weight"):
+        value = getattr(settings, name)
+        if not (math.isfinite(value) and value >= 0):
+            raise ValueError(f"decoder_train.{name} must be finite and non-negative")
+    if settings.l1_weight + settings.edge_weight <= 0:
+        raise ValueError("at least one decoder reconstruction weight must be positive")
+
+
+def decoder_architecture(config: "DecoderConfig") -> dict:
+    """The architecture fields that define a decoder's parameter shapes.
+
+    Used to compare a configuration against a checkpoint: two configurations with the
+    same dictionary build the same network, and any difference has to be resolved
+    before training rather than discovered as a shape error later.
+    """
+    return {
+        "image_size": int(config.image_size),
+        "base_channels": int(config.base_channels),
+        "channel_multipliers": [int(value) for value in config.channel_multipliers],
+        "stem_blocks": int(config.stem_blocks),
+        "blocks_per_stage": int(config.blocks_per_stage),
+    }

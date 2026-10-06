@@ -59,6 +59,28 @@ wpm-video train --config <config> --out <dir>
   - `best.pt`：**仅验证指标改善时**写出；
   - `final.pt`：训练结束（达到 `max_steps` 或墙钟上限）时写出。
 
+## train-decoder
+
+可选：训练 RGB 解码器。编码器与世界模型保持冻结，输入是缓存 token 的投影 latent，目标是
+同一分块在源视频里的**最后采样帧**。
+
+```text
+wpm-video train-decoder --config <config> --checkpoint <world 的 checkpoint> --out <dir>
+                        [--resume <decoder checkpoint>]
+```
+
+- 划分来自 world checkpoint 的 provenance，**不能**用命令行指定；checkpoint 必须由本包的
+  `train` 写出。train/val 共享文件或来源 identity 时报错。
+- 训练前会核对调用方 config 的编码器身份/采样参数与 checkpoint 记录的配置一致、token
+  缓存由该编码器写出、源视频与缓存逐字节一致且分块时间戳完全对齐；不通过就不开始训练。
+- 只用训练集拟合"常量帧参考"，不在验证集上拟合任何统计量。
+- `--resume` 恢复优化器、步数、采样器与分块生成器、CPU/CUDA 随机状态；**checkpoint 的
+  架构（含输出分辨率）是权威**，与 config 的 `decoder` 段不一致会报错。
+- 产物：`initial.pt`/`best.pt`/`final.pt`（按留出 L1）、`train_log.jsonl`、
+  `train_summary.json`（含 `l1`/`mse`/`psnr_db`、`constant_frame_reference`、`per_video`）、
+  `config.json` 与 `splits.json`（写实际生效的架构与划分）。
+- 细节与指标定义见 [decoder.md](decoder.md)。
+
 ## eval
 
 ```text
@@ -79,12 +101,15 @@ wpm-video eval --config <config> --checkpoint <run>/best.pt --out <dir> [--batch
 ```text
 wpm-video predict --config <config> --checkpoint <checkpoint> --video <clip.mp4>
                   --out <dir> [--prefix-chunks N] [--state <world_state.pt>]
+                  [--decoder-checkpoint <decoder.pt>]
 ```
 
 - 只需要 checkpoint、编码器配置和视频；不需要训练数据或缓存，可跨机器使用。
 - `--state` 从已保存状态继续：已经被该状态观察过的分块会跳过，不会让时间倒退。
 - 视频短于 `--prefix-chunks` 时按实际分块数处理，并在 summary 记录
   `prefix_clamped` 与 `chunks_in_video`。
+- `--decoder-checkpoint` **可选**：给出后额外把预测 latent 与真值未来 latent 解码成关键帧
+  图片。兼容性在写任何图之前检查，不匹配直接报错。
 - 产物：
   - `world_state.pt`：持久状态（slots、速度、float64 时钟、步数）
   - `future_latents.pt`：`{"predictions": {horizon: {...}}, "meta": {...}}`，
@@ -92,10 +117,21 @@ wpm-video predict --config <config> --checkpoint <checkpoint> --video <clip.mp4>
   - `predict_summary.json`：视频与来源哈希、前缀与钳制信息、状态时间；每个 horizon
     的非张量字段都在这里（`horizon_chunks`、`delta_seconds`、`target_time_seconds`、
     `scored`、`target_start_seconds`、`target_end_seconds`，有真值时还有
-    `nll_bits_per_dim` 与 `mse`）
+    `nll_bits_per_dim` 与 `mse`）；`decoded_rgb` 记录解码产物与时间语义，未启用时为 `null`
   - `frames.png`：观测前缀帧与真实未来帧（参考用，不生成新画面）
   - `uncertainty.png`：预测 σ 与实测误差
   - `pca_meta.json`（以及可用时的 `latent_pca.png`）：见下
+  - 仅当传了 `--decoder-checkpoint`：
+    - `decoded_h<horizon>.png`：**预测 mu** 解码出的关键帧
+    - `target_reconstruction_h<horizon>.png`：解码器作用在**真值未来 latent** 上（单独
+      评价解码器）
+    - `decoded_predictions.pt` / `decoded_targets.pt`：`float32 (3, S, S)`，`[0, 1]`
+    - `decoded_summary.json`：每张图的时间/horizon 元数据
+    - `decoded_frames.png`：观测前缀+真值帧 / 预测解码 / 真值 latent 重建 的三行对照图
+
+  解码帧是**彼此独立的关键帧**（按 horizon 排列），不是连续视频；时间元数据同时给出
+  `chunk_end_seconds` 与 `target_frame_timestamp_seconds`（后者是分块内最后被采样帧的真实
+  时间，即分块结束时间减去一个源帧周期）。
 
 PCA 说明：`latent_pca.png` 只用训练集 latent 拟合。checkpoint 无训练划分信息或
 本机无对应 token 缓存时跳过，`pca_meta.json` 记录 `status="skipped"` 与 `reason`；
@@ -105,15 +141,20 @@ PCA 说明：`latent_pca.png` 只用训练集 latent 拟合。checkpoint 无训�
 
 ```text
 wpm-video query --config <config> --checkpoint <checkpoint> --state <world_state.pt>
-                --deltas <秒> [<秒> ...] [--out <dir>]
+                --deltas <秒> [<秒> ...] [--out <dir>] [--decoder-checkpoint <decoder.pt>]
 ```
 
-从状态出发预测若干未来时刻，不需要视频与编码器。产物：
+从状态出发预测若干未来时刻，不需要视频与编码器；加了 `--decoder-checkpoint` 也不需要
+（解码只吃 latent），但必须有 `--out` 才能写图。产物：
 
 - `state_query.json`：`state_path`、`state_time_seconds`、`state_step`，以及
   `queries`——以 Δ 秒字符串为键，每项含 `target_time_seconds`、`mean_sigma`、
-  `mu_std`；
-- `state_query_latents.pt`：以 Δ 秒字符串为键，每项含张量 `mu`、`sigma`。
+  `mu_std`；`decoded_rgb` 为解码元数据或 `null`；
+- `state_query_latents.pt`：以 Δ 秒字符串为键，每项含张量 `mu`、`sigma`；
+- 仅当传了 `--decoder-checkpoint`：`decoded_d<Δ>s.png`、`state_query_decoded.pt`、
+  `decoded_summary.json`。查询没有视频，因此 `source_fps` 与
+  `target_frame_timestamp_seconds` 记为 `null`，并在 `timestamp_basis` 说明像素时间未知
+  ——分块结束时间只是查询锚点，不会被当成帧的拍摄时间。
 
 ## provenance
 
