@@ -37,13 +37,14 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from ..config import RunConfig, decoder_architecture
+from ..config import RunConfig, decoder_architecture, decoder_config_snapshot
 from ..dataset import TokenDataset, WindowSampler, check_split_integrity
 from ..model import VideoWorldModel
 from ..performance import (autocast_context, build_optimizer, optimizer_policy, precision_policy,
                            require_matching_policy, should_pin, to_device)
 from ..train import materialize_stats, rng_restore, rng_snapshot, set_determinism, source_signature
 from .compat import (DecoderCompatibilityError, check_decoder_compatibility, decoder_identity)
+from .base import _check_rgb_output
 from .model import build_decoder, save_decoder
 from .targets import ChunkFrameSource, alignment_record
 
@@ -202,6 +203,10 @@ def decoder_loss(prediction: torch.Tensor, target: torch.Tensor, l1_weight: floa
     """
     if stats_mode not in ("float", "tensor"):
         raise ValueError(f"stats_mode must be 'float' or 'tensor', got {stats_mode!r}")
+    if not torch.is_tensor(target) or target.dim() != 4:
+        raise ValueError("decoder target must have shape (B, 3, S, S)")
+    _check_rgb_output(target.float(), target.shape[0], target.shape[-1])
+    _check_rgb_output(prediction, target.shape[0], target.shape[-1])
     prediction, target = prediction.float(), target.float()
     l1 = (prediction - target).abs().mean()
     edge = edge_l1(prediction, target)
@@ -230,29 +235,32 @@ def evaluate_decoder(world_model, decoder, dataset: TokenDataset, frame_source: 
     sampler = WindowSampler(dataset, seed=seed)
     per_video, total_square, total_abs, frames_seen = {}, 0.0, 0.0, 0
     reference_totals = {"abs": 0.0, "square": 0.0}
-    for _ in range(batches):
-        windows = sampler.sample(config.decoder_train.batch_windows)
-        latents, targets, records = gather_decoder_batch(
-            world_model, frame_source, dataset, windows, device, deterministic=True,
-            performance=config.performance
-        )
-        prediction = decoder(latents)
-        difference = prediction - targets
-        absolute = difference.abs().flatten(1).mean(dim=1)
-        square = difference.pow(2).flatten(1).mean(dim=1)
-        for index, record in enumerate(records):
-            entry = per_video.setdefault(record["video"], {"abs": 0.0, "square": 0.0, "n": 0})
-            entry["abs"] += float(absolute[index])
-            entry["square"] += float(square[index])
-            entry["n"] += 1
-        total_abs += float(absolute.sum())
-        total_square += float(square.sum())
-        frames_seen += len(records)
-        if reference is not None:
-            baseline = (reference.unsqueeze(0) - targets).flatten(1)
-            reference_totals["abs"] += float(baseline.abs().mean(dim=1).sum())
-            reference_totals["square"] += float(baseline.pow(2).mean(dim=1).sum())
-    decoder.train(was_training)
+    try:
+        for _ in range(batches):
+            windows = sampler.sample(config.decoder_train.batch_windows)
+            latents, targets, records = gather_decoder_batch(
+                world_model, frame_source, dataset, windows, device, deterministic=True,
+                performance=config.performance
+            )
+            prediction = decoder(latents)
+            _check_rgb_output(prediction, targets.shape[0], targets.shape[-1])
+            difference = prediction - targets
+            absolute = difference.abs().flatten(1).mean(dim=1)
+            square = difference.pow(2).flatten(1).mean(dim=1)
+            for index, record in enumerate(records):
+                entry = per_video.setdefault(record["video"], {"abs": 0.0, "square": 0.0, "n": 0})
+                entry["abs"] += float(absolute[index])
+                entry["square"] += float(square[index])
+                entry["n"] += 1
+            total_abs += float(absolute.sum())
+            total_square += float(square.sum())
+            frames_seen += len(records)
+            if reference is not None:
+                baseline = (reference.unsqueeze(0) - targets).flatten(1)
+                reference_totals["abs"] += float(baseline.abs().mean(dim=1).sum())
+                reference_totals["square"] += float(baseline.pow(2).mean(dim=1).sum())
+    finally:
+        decoder.train(was_training)
     if frames_seen == 0:
         raise RuntimeError(f"no held-out frames to evaluate for split {dataset.split!r}")
     metrics = {
@@ -455,12 +463,15 @@ def train_decoder(config: RunConfig, world_model: VideoWorldModel, decoder, fram
         "wall_seconds": time.monotonic() - started,
         "best": best,
         "final_val": metrics,
-        "decoder_config": vars(decoder.config),
+        "decoder_config": decoder_config_snapshot(decoder.config),
+        # the component that ran, described the same way a checkpoint describes it:
+        # kind, canonical architecture (options included) and the shared geometry.
+        # Nothing here assumes a particular architecture's internal fields.
         "decoder": {
+            "kind": decoder.kind,
+            "architecture": decoder_architecture(decoder.config),
             "parameters": decoder.parameter_count(),
-            "image_size": decoder.config.image_size,
-            "base_channels": decoder.config.base_channels,
-            "channel_multipliers": list(decoder.config.channel_multipliers),
+            "image_size": decoder.output_size,
             "grid": list(decoder.grid),
             "d_world": decoder.d_world,
         },
@@ -513,26 +524,28 @@ def run_decoder_training(config: RunConfig, world_checkpoint, out_dir, device,
     if resume:
         decoder, payload = load_decoder(resume, map_location="cpu")
         check_decoder_compatibility(payload, world_model, config, decoder)
+        # the canonical record covers the component kind, its options and the output
+        # size: every field that changes which network is (or is not) being trained
         stored = decoder_architecture(decoder.config)
         if stored != decoder_architecture(config.decoder):
             raise DecoderCompatibilityError(
                 "config.decoder does not match the decoder being resumed:\n"
                 f"  - checkpoint architecture: {stored}\n"
                 f"  - config architecture:     {decoder_architecture(config.decoder)}\n"
-                "The checkpoint is authoritative, so either align the configuration or start a new "
-                "decoder run; a checkpoint and a configuration must not disagree about what was "
-                "trained."
+                "The checkpoint is authoritative, so either align the configuration (kind, "
+                "options and output size included) or start a new decoder run; a checkpoint and "
+                "a configuration must not disagree about what was trained."
             )
-        print(f"continuing decoder from {resume} (step {payload.get('step')}, output "
-              f"{decoder.config.image_size}px)", flush=True)
+        print(f"continuing {decoder.kind} decoder from {resume} (step {payload.get('step')}, "
+              f"output {decoder.output_size}px)", flush=True)
     else:
         decoder = build_decoder(config.decoder, world_model.patches, world_model.config.d_world)
     decoder = decoder.to(device)
     train_set, val_set, frame_source, splits = prepare_decoder_data(
-        config, world_payload, decoder.config.image_size, world_checkpoint, world_model
+        config, world_payload, decoder.output_size, world_checkpoint, world_model
     )
-    print(f"decoder: {decoder.parameter_count():,} parameters, output "
-          f"{decoder.config.image_size}x{decoder.config.image_size} for a "
+    print(f"decoder: kind={decoder.kind}, {decoder.parameter_count():,} parameters, output "
+          f"{decoder.output_size}x{decoder.output_size} for a "
           f"{decoder.grid[0]}x{decoder.grid[1]} patch grid, d_world={decoder.d_world}", flush=True)
     record = {
         "path": str(world_checkpoint),

@@ -12,8 +12,11 @@ frozen encoder. See README.md and docs/ for usage.
 An *optional* RGB decoder (``wpm_video.decoder``) can turn those latents into
 keyframe images. It is trained separately against a frozen world checkpoint, is
 never part of the dynamics, and is only used when a decoder checkpoint is given
-explicitly. Decoded images are lossy reconstructions of one keyframe per chunk,
-not generated video; see docs/decoder.md.
+explicitly. The decoder is a replaceable component: ``config.decoder.kind`` selects
+a registered architecture (the built-in convolutional upsampler is the default, and
+a custom one registers itself with :func:`register_decoder` before use). Decoded
+images are lossy reconstructions of one keyframe per chunk, not generated video; see
+docs/decoder.md and docs/decoder_components.md.
 
 """
 from .config import (DataConfig, DecoderConfig, DecoderTrainConfig, EncoderConfig, ModelConfig,
@@ -23,10 +26,11 @@ from .data import (Chunk, VideoInfo, build_chunks, build_source_manifest, list_v
                    load_source_manifest, probe_video, read_frames, resolve_source)
 from .dataset import (TIMELINE_SCHEMA, TokenDataset, Window, WindowSampler, cache_video_tokens,
                       check_split_integrity, gather_batch, substeps_for)
-from .decoder import (ChunkFrameSource, DecoderCompatibilityError, LatentRGBDecoder,
-                      TARGET_SEMANTICS, alignment_record, build_decoder,
-                      check_decoder_compatibility, check_world_preprocessing, decode_latents,
-                      evaluate_decoder, load_decoder, projection_fingerprint, render_latents,
+from .decoder import (ChunkFrameSource, DecoderCompatibilityError, DecoderRegistrationError,
+                      LatentRGBDecoder, RGBDecoder, TARGET_SEMANTICS, alignment_record,
+                      available_decoders, build_decoder, check_decoder_compatibility,
+                      check_world_preprocessing, decode_latents, evaluate_decoder, load_decoder,
+                      projection_fingerprint, register_decoder, render_latents,
                       run_decoder_training, save_decoder, train_decoder)
 from .encoder import NativeEncoder, VJEPA2Encoder, build_encoder, cache_identity, cache_path
 from .evaluate import (BASELINES, baseline_summary, compare, evaluate_baselines,
@@ -41,7 +45,7 @@ from .train import (build_model, evaluate_model, fit_projection, materialize_sta
                     rng_snapshot, set_determinism, source_signature, train)
 from .world_state import WorldState
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "__version__",
@@ -52,7 +56,8 @@ __all__ = [
     "build_source_manifest", "load_source_manifest", "resolve_source",
     "TIMELINE_SCHEMA", "TokenDataset", "Window", "WindowSampler", "cache_video_tokens",
     "check_split_integrity", "gather_batch", "substeps_for",
-    "ChunkFrameSource", "DecoderCompatibilityError", "LatentRGBDecoder", "TARGET_SEMANTICS",
+    "ChunkFrameSource", "DecoderCompatibilityError", "DecoderRegistrationError",
+    "LatentRGBDecoder", "RGBDecoder", "TARGET_SEMANTICS", "register_decoder", "available_decoders",
     "alignment_record", "build_decoder", "check_decoder_compatibility", "check_world_preprocessing",
     "decode_latents", "evaluate_decoder", "load_decoder", "projection_fingerprint",
     "render_latents", "run_decoder_training", "save_decoder", "train_decoder",

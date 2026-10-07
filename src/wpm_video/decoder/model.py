@@ -1,158 +1,225 @@
-"""Optional RGB decoder: projected world latents of one chunk -> one RGB keyframe.
+"""Decoder checkpoints and the backward-compatible decoder entry points.
 
-The decoder turns the projected latent of a chunk, ``(B, P, d_world)`` with its
-``(gh, gw)`` patch layout, into ``(B, 3, S, S)`` pixels in ``[0, 1]`` with a small
-convolutional upsampler. Each output is **one keyframe**: the last sampled frame
-of that chunk. It is not a synthesis of every frame in the chunk and not a
-high-frame-rate video; a sequence of decoded horizons is a sparse set of
-keyframes, never a continuous clip.
+This module owns the on-disk format of a decoder checkpoint and keeps the imports
+that existed before decoders became replaceable components working unchanged:
+``LatentRGBDecoder``, ``build_decoder``, ``save_decoder``, ``load_decoder``,
+``group_count`` and ``DECODER_SCHEMA_VERSION`` are all still here, and
+``LatentRGBDecoder`` is still *the* conv network with the same parameter names,
+shapes and initialisation order, so state dicts written by earlier versions keep
+loading exactly as they did.
 
-The decoder is deliberately independent of the dynamics: it consumes latents and
-knows nothing about state, time or the predictor. It is also lossy by
-construction, because it inverts a frozen encoder plus a random projection that
-was never trained to be invertible. Expect blurry output and missing texture;
-this is a reconstruction aid, not a photorealistic generator. Nothing here should
-be called generated RGB until a decoder checkpoint trained on real data is
-supplied and its held-out metrics are reported.
+What changed is that a checkpoint now says **which component** it holds:
+
+- **schema 1** (written before decoder kinds existed) describes exactly one
+  architecture, the built-in conv upsampler. It has no ``kind`` and no ``options``;
+  reading it means "legacy conv" and nothing else. A schema-1 file that carries a
+  kind, or whose architecture record is not the historical conv one, is refused as
+  malformed instead of being normalized into whatever it might have meant.
+- **schema 2** (written from now on) records every configuration field explicitly
+  (``kind``/``image_size``/``options``, plus the conv shape fields for conv) and the
+  component identity in the architecture record, so two architectures with the same
+  output size can never be confused for one another and a truncated record is an
+  error rather than something completed with defaults.
+
+Both versions are read strictly: the architecture record must agree with the stored
+configuration, the grid and the dimensions must agree with each other, and the state
+dict must match the built module. A checkpoint of an unknown or future schema, or of
+a kind that is not registered in this process, fails before any weight or pixel is
+produced.
 """
 
-import math
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
-from torch import nn
 
-from ..config import DecoderConfig, decoder_architecture, validate_decoder_config
+from ..config import (CONV_ARCHITECTURE_FIELDS, CONV_DECODER_KIND, DecoderConfig,
+                      decoder_architecture, decoder_config_snapshot, validate_decoder_config)
+from .architectures.conv import LatentRGBDecoder, group_count
+from .base import RGBDecoder, grid_side
+from .registry import available_decoders, build_decoder, register_decoder
 
-# Checkpoint schema of this decoder. Bumping it invalidates older checkpoints
-# instead of silently reading them with new expectations.
-DECODER_SCHEMA_VERSION = 1
+# Checkpoint schema written by this version. Bumping it invalidates older
+# checkpoints instead of silently reading them with new expectations.
+DECODER_SCHEMA_VERSION = 2
+# Schema of checkpoints written before decoder architectures were selectable. They
+# can only describe the built-in conv decoder, which is what makes reading them
+# unambiguous.
+LEGACY_DECODER_SCHEMA_VERSION = 1
+SUPPORTED_DECODER_SCHEMA_VERSIONS = (LEGACY_DECODER_SCHEMA_VERSION, DECODER_SCHEMA_VERSION)
+
+# Top-level fields the format owns. Extra checkpoint metadata (provenance,
+# optimiser state, the run configuration) is stored beside them and may not
+# override them: the architecture and the weights a checkpoint holds are facts, not
+# annotations.
+RESERVED_CHECKPOINT_FIELDS = frozenset({
+    "kind", "schema_version", "decoder_config", "architecture", "patches", "d_world", "grid",
+    "state_dict", "path",
+})
+
+# FIELDS of a schema-1 decoder_config: exactly the conv architecture record.
+LEGACY_DECODER_CONFIG_FIELDS = CONV_ARCHITECTURE_FIELDS
+
+__all__ = [
+    "DECODER_SCHEMA_VERSION", "LEGACY_DECODER_SCHEMA_VERSION",
+    "SUPPORTED_DECODER_SCHEMA_VERSIONS", "RESERVED_CHECKPOINT_FIELDS",
+    "LatentRGBDecoder", "RGBDecoder", "group_count", "build_decoder", "register_decoder",
+    "available_decoders", "checkpoint_schema_version", "checkpoint_component_kind",
+    "save_decoder", "load_decoder",
+]
 
 
-def group_count(channels: int) -> int:
-    """Largest usable GroupNorm group count for a channel width (1 when unusual)."""
-    for groups in (8, 4, 2):
-        if channels % groups == 0:
-            return groups
-    return 1
+def checkpoint_schema_version(payload: Mapping) -> "int | None":
+    """The checkpoint's schema version, or ``None`` unless it is a supported integer.
 
-
-def _conv_block(c_in: int, c_out: int) -> list:
-    return [nn.Conv2d(c_in, c_out, 3, padding=1), nn.GroupNorm(group_count(c_out), c_out), nn.SiLU()]
-
-
-class LatentRGBDecoder(nn.Module):
-    """Compact convolutional upsampler from a patch-latent grid to RGB pixels.
-
-    The latent is reshaped to its ``(gh, gw)`` grid (row-major patch order), a
-    learned position embedding is added, then ``stem_blocks`` convolutions run at
-    grid resolution and ``log2(image_size / grid_side)`` nearest-neighbour
-    upsampling stages double the resolution until it reaches ``image_size``. A
-    3x3 convolution maps to three channels and a sigmoid bounds the output.
+    ``True`` is not schema 1: a boolean (or a string) is a malformed version, not a
+    value to be compared loosely.
     """
+    version = payload.get("schema_version") if isinstance(payload, Mapping) else None
+    return version if type(version) is int and version in SUPPORTED_DECODER_SCHEMA_VERSIONS \
+        else None
 
-    def __init__(self, config: DecoderConfig, patches: int, d_world: int):
-        super().__init__()
-        # The module is a public entry point: validate the architecture here, not only
-        # through RunConfig, so a hand-built DecoderConfig cannot build a network whose
-        # channel shapes are wrong (e.g. zero stem blocks would drop the width change).
-        validate_decoder_config(config)
-        if type(patches) is not int or patches < 1:
-            raise ValueError("patches must be a positive integer")
-        side = int(round(math.sqrt(patches)))
-        if side * side != patches:
-            raise ValueError(f"patches must be a perfect square, got {patches}")
-        if type(d_world) is not int or d_world < 1:
-            raise ValueError("d_world must be a positive integer")
-        if config.image_size < side:
+
+def checkpoint_component_kind(payload: Mapping) -> "str | None":
+    """Decoder component kind a checkpoint records, or ``None`` if it records none.
+
+    A schema-1 checkpoint predates kinds and can only hold the built-in conv
+    architecture, so "no kind" there means ``"conv"`` rather than "unknown". For a
+    later schema the kind must be declared explicitly: guessing it from the
+    architecture record is exactly the silent mismatch this function exists to
+    prevent.
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    if checkpoint_schema_version(payload) == LEGACY_DECODER_SCHEMA_VERSION:
+        return CONV_DECODER_KIND
+    stored = payload.get("decoder_config")
+    kind = stored.get("kind") if isinstance(stored, Mapping) else None
+    return kind if isinstance(kind, str) and kind else None
+
+
+def decoder_config_from_payload(payload: Mapping, version: int, source=None) -> DecoderConfig:
+    """Rebuild the decoder configuration a checkpoint records, or explain why it cannot.
+
+    ``version`` is the checkpoint's schema, already checked to be supported. Schema 1
+    is normalized to ``kind="conv"``/``options={}`` because that is what it means --
+    and it must carry exactly the historical conv fields, so a truncated or
+    hand-edited record fails here instead of being completed with defaults that
+    describe a network the checkpoint never held.
+    """
+    where = str(source) if source is not None else "the decoder checkpoint"
+    stored = payload.get("decoder_config")
+    if not isinstance(stored, Mapping):
+        raise ValueError(f"{where} is missing 'decoder_config'; it is not a complete decoder "
+                         "checkpoint")
+    if version == LEGACY_DECODER_SCHEMA_VERSION:
+        # schema 1 has exactly the historical conv fields: complete, and nothing else
+        unexpected = sorted(set(stored) - set(LEGACY_DECODER_CONFIG_FIELDS))
+        if unexpected:
             raise ValueError(
-                f"decoder.image_size ({config.image_size}) must not be smaller than the patch "
-                f"grid side ({side}); every latent cell has to cover at least one pixel"
+                f"{where} is a schema-1 checkpoint, which predates selectable decoder "
+                f"architectures, but its decoder_config carries {unexpected}; it is not read as "
+                "legacy conv"
             )
-        if config.image_size % side:
+        required = LEGACY_DECODER_CONFIG_FIELDS
+    else:
+        shared = ("kind", "image_size", "options")
+        unexpected = sorted(set(stored) - set(DecoderConfig.__dataclass_fields__))
+        if unexpected:
             raise ValueError(
-                f"decoder.image_size ({config.image_size}) must be a multiple of the patch grid "
-                f"side ({side}); the decoder upsamples the latent grid by a whole factor"
+                f"{where} records decoder_config fields this version does not know: {unexpected}"
             )
-        factor = config.image_size // side
-        if factor & (factor - 1):
+        if not isinstance(stored.get("kind"), str) or not stored.get("kind"):
             raise ValueError(
-                f"decoder.image_size / patch grid side ({config.image_size}/{side} = {factor}) "
-                "must be a power of two so every upsampling stage is exact"
+                f"{where} does not record 'decoder_config.kind'; a schema-2 decoder checkpoint "
+                "must name the component architecture that produced it"
             )
-        if not config.channel_multipliers:
-            raise ValueError("decoder.channel_multipliers must not be empty")
-        self.config = config
-        self.patches = patches
-        self.d_world = d_world
-        self.grid = (side, side)
-        self.stages_count = int(math.log2(factor))
-        base = config.base_channels
-        widths = [base * multiplier for multiplier in config.channel_multipliers]
-        self.stem = nn.Sequential(*[
-            layer for index in range(config.stem_blocks)
-            for layer in _conv_block(d_world if index == 0 else base, base)
-        ])
-        stages, c_in = [], base
-        for index in range(self.stages_count):
-            c_out = widths[min(index, len(widths) - 1)]
-            layers = [nn.Upsample(scale_factor=2, mode="nearest")]
-            for block in range(config.blocks_per_stage):
-                layers += _conv_block(c_in if block == 0 else c_out, c_out)
-            stages.append(nn.Sequential(*layers))
-            c_in = c_out
-        self.stages = nn.ModuleList(stages)
-        self.head = nn.Conv2d(c_in, 3, 3, padding=1)
-        nn.init.zeros_(self.head.bias)
-        # Position embedding: the projection is content-blind, so the grid offset
-        # is the only place the decoder learns *where* a patch sits.
-        self.position = nn.Parameter(torch.randn(1, d_world, side, side) * 0.02)
+        # the shared fields, plus the conv fields for conv: a truncated record is an
+        # error, never completed with defaults that describe a network it never held
+        required = shared + (CONV_ARCHITECTURE_FIELDS
+                             if stored["kind"] == CONV_DECODER_KIND else ())
+    missing = [name for name in required if name not in stored]
+    if missing:
+        raise ValueError(
+            f"{where} is missing 'decoder_config.{missing[0]}'; a schema-{version} decoder "
+            "configuration records "
+            + ("the complete conv architecture" if version == LEGACY_DECODER_SCHEMA_VERSION
+               else "kind, image_size and options")
+            + " and is not completed with defaults"
+        )
+    try:
+        config = DecoderConfig(**stored)
+    except TypeError as error:
+        raise ValueError(f"{where} has a malformed decoder_config: {error}") from error
+    validate_decoder_config(config)
+    return config
 
-    @property
-    def output_size(self) -> int:
-        return self.config.image_size
 
-    def parameter_count(self) -> int:
-        return sum(parameter.numel() for parameter in self.parameters())
+def normalize_architecture_record(payload: Mapping, version: int, source=None) -> dict:
+    """The architecture record of a checkpoint in canonical (current) form.
 
-    def check_input(self, latents: torch.Tensor) -> None:
-        """Shape contract, checked without a device synchronisation."""
-        if not torch.is_tensor(latents) or latents.dim() != 3:
-            raise ValueError(f"decoder input must be a (B, P, d_world) tensor, got {type(latents)}")
-        batch, patches, width = latents.shape
-        if patches != self.patches or width != self.d_world:
+    Schema 1 predates decoder kinds: its record is exactly the historical conv shape
+    dictionary, so it is completed with ``kind="conv"`` for comparison. Anything
+    else -- a missing field, an extra one, a schema-2 record without a kind -- is
+    refused; the function never repairs a record into agreeing with a configuration.
+    """
+    where = str(source) if source is not None else "the decoder checkpoint"
+    stored = payload.get("architecture")
+    if not isinstance(stored, Mapping) or not stored:
+        raise ValueError(f"{where} does not record 'architecture'; it is not a complete decoder "
+                         "checkpoint")
+    if version == LEGACY_DECODER_SCHEMA_VERSION:
+        unexpected = sorted(set(stored) - set(CONV_ARCHITECTURE_FIELDS))
+        missing = [name for name in CONV_ARCHITECTURE_FIELDS if name not in stored]
+        if unexpected or missing:
             raise ValueError(
-                f"decoder expects latents of shape (B, {self.patches}, {self.d_world}) for the "
-                f"checkpoint's patch grid, got (B, {patches}, {width})"
+                f"{where} is a schema-1 checkpoint, whose architecture record is exactly the conv "
+                f"architecture; got keys {sorted(stored)}"
+                + (f" (missing {missing})" if missing else "")
             )
-        if batch < 1:
-            raise ValueError("decoder input must have at least one sample")
-        if not latents.is_floating_point():
-            raise ValueError(f"decoder input must be a floating point tensor, got {latents.dtype}")
-
-    def forward(self, latents: torch.Tensor) -> torch.Tensor:
-        self.check_input(latents)
-        rows, cols = self.grid
-        hidden = latents.transpose(1, 2).reshape(latents.shape[0], self.d_world, rows, cols)
-        hidden = hidden + self.position.to(hidden.dtype)
-        hidden = self.stem(hidden)
-        for stage in self.stages:
-            hidden = stage(hidden)
-        return torch.sigmoid(self.head(hidden))
+        return {"kind": CONV_DECODER_KIND,
+                **{name: stored[name] for name in CONV_ARCHITECTURE_FIELDS}}
+    return dict(stored)
 
 
-def build_decoder(config: DecoderConfig, patches: int, d_world: int) -> LatentRGBDecoder:
-    """Construct a decoder for a world model with ``patches`` and ``d_world``."""
-    return LatentRGBDecoder(config, patches, d_world)
+def save_decoder(path, decoder: RGBDecoder, extra: dict | None = None) -> None:
+    """Write a decoder checkpoint; ``extra`` carries the identity and provenance.
 
-
-def save_decoder(path, decoder: LatentRGBDecoder, extra: dict | None = None) -> None:
-    """Write a decoder checkpoint; ``extra`` carries the identity and provenance."""
+    ``extra`` is merged beside the format fields and may not redefine them: a caller
+    cannot replace the recorded architecture, dimensions or weights with metadata.
+    """
+    if not isinstance(decoder, RGBDecoder):
+        raise ValueError(
+            f"save_decoder expects an RGBDecoder, got {type(decoder).__name__}; a custom "
+            "architecture must subclass wpm_video.decoder.RGBDecoder"
+        )
+    config = decoder.config
+    validate_decoder_config(config)
+    side = grid_side(decoder.patches)
+    if tuple(decoder.grid) != (side, side):
+        raise ValueError(
+            f"cannot save a decoder whose grid {tuple(decoder.grid)} does not match its "
+            f"{decoder.patches} patches ({(side, side)})"
+        )
+    if decoder.output_size != int(config.image_size):
+        raise ValueError(
+            f"cannot save a decoder that outputs {decoder.output_size}px while its configuration "
+            f"declares decoder.image_size={config.image_size}"
+        )
+    if extra:
+        if not isinstance(extra, Mapping):
+            raise ValueError(f"decoder checkpoint metadata must be a mapping, got {type(extra)}")
+        reserved = sorted(set(extra) & RESERVED_CHECKPOINT_FIELDS)
+        if reserved:
+            raise ValueError(
+                f"decoder checkpoint metadata may not override {reserved}; these fields describe "
+                "the architecture, the weights and the dimensions the file actually holds"
+            )
     payload = {
         "kind": "rgb_decoder",
         "schema_version": DECODER_SCHEMA_VERSION,
-        "decoder_config": vars(decoder.config),
-        "architecture": decoder_architecture(decoder.config),
+        "decoder_config": decoder_config_snapshot(config),
+        "architecture": decoder_architecture(config),
         "patches": decoder.patches,
         "d_world": decoder.d_world,
         "grid": list(decoder.grid),
@@ -169,28 +236,70 @@ def load_decoder(path, map_location="cpu"):
     The returned ``payload["path"]`` is the absolute resolved path this checkpoint was
     read from, so artifacts written from it name the decoder that produced them.
 
-    The checkpoint must be a decoder of the current schema; a world-model checkpoint,
-    a truncated file or a future schema is refused with a readable message rather than
-    loaded partially.
+    The checkpoint must be a decoder of a supported schema (1, the legacy conv
+    architecture, or 2, which names its component). A world-model checkpoint, a
+    truncated file, a future schema, an unknown component kind or a record whose
+    architecture disagrees with its configuration is refused with a readable message
+    rather than loaded partially -- before any weight is transferred into a module.
     """
     payload = torch.load(path, map_location=map_location, weights_only=False)
-    if not isinstance(payload, dict) or payload.get("kind") != "rgb_decoder":
+    if not isinstance(payload, Mapping) or payload.get("kind") != "rgb_decoder":
         raise ValueError(
             f"{path} is not an RGB decoder checkpoint (expected kind='rgb_decoder'); a world "
             "model checkpoint cannot be used as --decoder-checkpoint"
         )
-    version = payload.get("schema_version")
-    if version != DECODER_SCHEMA_VERSION:
+    version = checkpoint_schema_version(payload)
+    if version is None:
         raise ValueError(
-            f"{path} has decoder schema_version {version!r}, this package writes and reads "
+            f"{path} has decoder schema_version {payload.get('schema_version')!r}, this package "
+            f"reads {list(SUPPORTED_DECODER_SCHEMA_VERSIONS)} and writes "
             f"{DECODER_SCHEMA_VERSION}; retrain the decoder with this version"
         )
-    for field in ("decoder_config", "patches", "d_world", "state_dict"):
+    for field in ("decoder_config", "architecture", "patches", "d_world", "grid", "state_dict"):
         if field not in payload:
             raise ValueError(f"{path} is missing '{field}'; it is not a complete decoder checkpoint")
-    decoder = LatentRGBDecoder(DecoderConfig(**payload["decoder_config"]), payload["patches"],
-                               payload["d_world"])
-    decoder.load_state_dict(payload["state_dict"])
+    config = decoder_config_from_payload(payload, version, path)
+    patches, d_world = payload["patches"], payload["d_world"]
+    if type(patches) is not int or type(d_world) is not int or patches < 1 or d_world < 1:
+        raise ValueError(
+            f"{path} records patches={patches!r} and d_world={d_world!r}; both must be positive "
+            "integers"
+        )
+    stored_architecture = normalize_architecture_record(payload, version, path)
+    expected_architecture = decoder_architecture(config)
+    if stored_architecture != expected_architecture:
+        raise ValueError(
+            f"{path} is inconsistent: its architecture record {stored_architecture} does not "
+            f"describe its decoder_config {expected_architecture}; the file was edited or "
+            "truncated and is not loaded"
+        )
+    stored_grid = payload["grid"]
+    side = grid_side(patches)
+    if not isinstance(stored_grid, (list, tuple)) or list(stored_grid) != [side, side]:
+        raise ValueError(
+            f"{path} records grid={stored_grid!r} for {patches} patches (expected {[side, side]})"
+        )
+    stored_state = payload["state_dict"]
+    if not isinstance(stored_state, Mapping) or not stored_state:
+        raise ValueError(f"{path} records no decoder weights")
+    not_tensors = sorted(key for key, value in stored_state.items() if not torch.is_tensor(value))
+    if not_tensors:
+        raise ValueError(
+            f"{path} records {not_tensors} as something other than tensors; the weights were "
+            "rewritten (a checkpoint must be saved and loaded as a file, not through JSON)"
+        )
+    # dispatch through the registry: an unregistered kind is refused here, with the
+    # registered names listed, instead of falling back to any built-in architecture
+    decoder = build_decoder(config, patches, d_world)
+    if tuple(decoder.grid) != (side, side):
+        raise ValueError(f"{path}: the {config.kind!r} decoder does not match the recorded grid")
+    try:
+        decoder.load_state_dict(stored_state)
+    except RuntimeError as error:
+        raise ValueError(
+            f"{path} holds weights that do not fit its recorded {config.kind!r} architecture "
+            f"({expected_architecture}): {error}"
+        ) from error
     # where this checkpoint was actually read from, so artifacts and summaries can
     # name it; the saved file never records its own location, the loader adds it
     payload["path"] = str(Path(path).resolve())

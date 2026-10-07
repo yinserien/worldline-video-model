@@ -181,9 +181,37 @@ payload["path"]                                # 该 checkpoint 的绝对路径�
 （因此 CPU 上加载的解码器也能解码 GPU 上的 latent），并恢复调用前的 train/eval 模式；
 解码器之后留在该设备上，不会悄悄被移回。上面的 `.to(device)` 不是必需但更直观。
 
+解码器是**可替换组件**：`config.decoder.kind` 选择架构，`"conv"` 是内置默认值。
+
+```python
+from wpm_video import RGBDecoder, available_decoders, register_decoder
+
+class MyDecoder(RGBDecoder):        # 契约：(B, P, d_world) -> (B, 3, S, S) in [0, 1]
+    def __init__(self, config, patches, d_world):
+        super().__init__(config, patches, d_world)     # 校验并保存共享几何
+        ...
+    def forward(self, latents):
+        self.check_input(latents)
+        ...
+
+register_decoder("myarch", MyDecoder)     # 进程内有效；未知 kind 一律报错
+assert "myarch" in available_decoders()
+```
+
+| 调用 | 返回 | 说明 |
+|---|---|---|
+| `register_decoder(kind, factory)` | `factory` | 注册 `factory(config, patches, d_world) -> RGBDecoder`；可当装饰器用。名字只注册一次（重复、含覆盖 `conv` 都报错），进程内有效，不做插件发现。kind 标识**实现及其语义**：语义变了要换新名字（`my_decoder_v2`）并保留旧名以读取旧权重 |
+| `available_decoders()` | `tuple[str, ...]` | 当前进程已注册的 kind（有序） |
+| `decoder.kind` / `.config` / `.patches` / `.d_world` / `.grid` / `.output_size` | `str` / `DecoderConfig` / `int` / `int` / `(gh, gw)` / `int` | 组件元数据；`config.options` 与整个 config 都是构建时的深拷贝快照 |
+| `decoder.check_input(latents)` | `None` | 输入契约；架构可在 `forward` 里先调用它 |
+| `decoder.parameter_count()` | `int` | 参数量，与 checkpoint 记录的一致 |
+
+契约、注册生命周期、checkpoint schema 与对照实验协议见
+[decoder_components.md](decoder_components.md)。
+
 | 调用 | 形状 / 类型 | 说明 |
 |---|---|---|
-| `build_decoder(config.decoder, patches, d_world)` | `LatentRGBDecoder` | 构建时即校验架构与网格；非法配置直接抛 `ValueError` |
+| `build_decoder(config.decoder, patches, d_world)` | `RGBDecoder`（`kind="conv"` 时是 `LatentRGBDecoder`） | 按 `config.decoder.kind` 分发到已注册工厂；构建时即校验配置、网格与工厂返回的元数据；非法配置或未注册 kind 直接抛 `ValueError`（`DecoderRegistrationError` 是其子类） |
 | `decoder(latents)` | `(B, P, d_world)` -> `(B, 3, S, S)` | 输入形状不对（`P`/`d_world`/维度）抛 `ValueError`；输出是 `[0, 1]` |
 | `decoder.parameter_count()` / `decoder.output_size` / `decoder.grid` | `int` / `int` / `(gh, gw)` | 参数量、输出边长、latent 网格 |
 | `decode_latents(decoder, {键: (P, d_world)}, device)` | `{键: (3, S, S)}` float `[0, 1]` | 把解码器与 latent 都移到 `device`，推理模式下运行并恢复原 mode；键可以是 horizon 或 Δ 秒 |
@@ -191,7 +219,7 @@ payload["path"]                                # 该 checkpoint 的绝对路径�
 | `to_uint8(image)` / `save_frame_png(image, path)` | `(S, S, 3)` uint8 / 路径 | `[0,1]` float 三通道 RGB -> PNG（磁盘上是 BGR 字节序） |
 | `run_decoder_training(config, world_checkpoint, out_dir, device, resume="")` | dict | 见下 |
 | `evaluate_decoder(world_model, decoder, dataset, frame_source, config, device, batches, reference=None)` | dict | `l1`/`mse`/`psnr_db`/`per_video`；只读验证集，消耗零随机数 |
-| `load_decoder(path)` | `(LatentRGBDecoder, payload)` | 默认在 CPU 上构建；`payload["path"]` 是绝对路径；非解码器 checkpoint 或无 `schema_version` 时抛 `ValueError` |
+| `load_decoder(path)` | `(RGBDecoder, payload)` | 默认在 CPU 上构建，按 checkpoint 记录的 `kind` 分发；`payload["path"]` 是绝对路径；非解码器 checkpoint、不支持的 schema、未注册 kind、或元数据/权重不自洽时抛 `ValueError`（**在读入权重之前**） |
 | `check_decoder_compatibility(payload, model, config, decoder=None)` | dict | 不匹配抛 `DecoderCompatibilityError`（`ValueError` 子类） |
 
 `run_decoder_training` 的输入是**世界模型 checkpoint 路径**，内部按顺序：加载并冻结世界

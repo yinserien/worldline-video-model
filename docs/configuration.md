@@ -123,11 +123,24 @@ config.validate()                        # load 时已自动调用
 
 | 字段 | 默认值 | 约束 |
 |---|---|---|
-| `image_size` | `128` | 输出边长，`[32, 2048]` 且为 8 的倍数；另需是 patch 网格边长的 2 的幂倍（在构建时检查） |
-| `base_channels` | `128` | `[1, 2048]` |
-| `channel_multipliers` | `[1, 2, 2]` | 非空，每项为 `[1, 64]` 的整数 |
-| `stem_blocks` | `2` | 整数 `>= 1`，网格分辨率上的卷积层数 |
-| `blocks_per_stage` | `1` | 整数 `>= 1`，每次上采样后的卷积层数 |
+| `kind` | `"conv"` | 组件架构名：小写标识符，必须是已注册的 kind（见 [decoder_components.md](decoder_components.md)）；`"conv"` 是内置且默认的。它标识**实现及其语义**（见 [kind 的语义与版本](decoder_components.md#kind-的语义与版本)），语义变了要换名字 |
+| `options` | `{}` | 该架构自己的设置：必须是 dict，键为字符串，值要能原样通过 JSON 往返（只有 dict/list/字符串/有限数字/布尔/null；tuple、set、对象、循环引用都拒绝）；`kind="conv"` 时必须为空。名字空间独立，选项不会覆盖身份字段 |
+| `image_size` | `128` | 所有架构共享的输出边长，`[32, 2048]` 且为 8 的倍数；更严的几何约束（如 conv 的"网格边长的整数倍且为 2 的幂"）由架构自己检查 |
+| `base_channels` | `128` | `[1, 2048]`；**仅 conv**，其他 kind 必须保持默认值 |
+| `channel_multipliers` | `[1, 2, 2]` | 非空，每项为 `[1, 64]` 的整数；**仅 conv** |
+| `stem_blocks` | `2` | 整数 `>= 1`，网格分辨率上的卷积层数；**仅 conv** |
+| `blocks_per_stage` | `1` | 整数 `>= 1`，每次上采样后的卷积层数；**仅 conv** |
+
+`kind`/`options` 是后加的字段，旧 `config.json`（没有它们）加载后即 `kind="conv"`、
+`options={}`，行为不变。kind 的**语法**与共享字段在加载/校验时检查（不需要注册表），
+**是否已注册**在构建或加载 checkpoint 时检查：未知 kind 报错并列出已注册的 kind，绝不
+回退到某个内置架构。
+
+`base_channels` 等 conv 字段在 `kind != "conv"` 时必须保持默认值：它们既不参与该架构的
+身份，也不参与它构建的网络，接受了就等于记录一个不生效的设置。自定义架构改用 `options`
+描述自己（示例见 [decoder_components.md](decoder_components.md#配置选择)）。**架构身份**
+记录为 `{"kind", "image_size", "options"}`（conv 为 `{"kind", "image_size"}` 加四个形状
+字段），选项嵌在自己的块里，因此选项名不会与身份字段冲突。
 
 ## decoder_train
 
@@ -178,10 +191,16 @@ config.validate()                        # load 时已自动调用
 世界模型的 checkpoint（`initial.pt` / `best.pt` / `final.pt`）保存：模型与配置、投影与
 标准化 buffer、优化器、步数、采样器与 CPU/CUDA 随机状态、训练 provenance。
 
-解码器的 checkpoint 名字相同但内容不同（`kind="rgb_decoder"`）：解码器配置与架构、
+解码器的 checkpoint 名字相同但内容不同（`kind="rgb_decoder"`）：解码器配置与**组件架构**
+（`decoder_config` 里的 `kind`/`options` 与规范化的 `architecture` 记录）、
 **world 投影 buffer 的 SHA-256 指纹**、编码器身份、采样参数、目标帧语义与分辨率、
 优化器、步数、两个采样生成器与 CPU/CUDA 随机状态，以及实际生效的 `performance` 策略。
-给 `--decoder-checkpoint` 传世界模型 checkpoint 会被明确拒绝。见 [decoder.md](decoder.md)。
+给 `--decoder-checkpoint` 传世界模型 checkpoint 会被明确拒绝。
+
+解码器 checkpoint 现在写 **schema 2**；v0.4.0 及更早的 **schema 1**（没有 `kind`/`options`）
+仍可读取、比对与续训，并被明确解释为内置 conv 架构，缺字段/多字段一律报错而不是补齐。
+附加元数据不能覆盖 `schema_version`/`decoder_config`/`architecture`/`state_dict` 等格式
+字段。见 [decoder.md](decoder.md) 与 [decoder_components.md](decoder_components.md)。
 
 - 用 `--resume <checkpoint>` 继续训练：恢复优化器与随机状态，沿用配置里的数据划分，
   `max_steps` 为总目标步数。`initial.pt` 只在新训练时写出，`best.pt` 只在验证指标

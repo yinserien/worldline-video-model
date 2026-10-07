@@ -79,15 +79,21 @@ wpm-video train-decoder --config <config> --checkpoint <world 的 checkpoint> --
   缓存由该编码器写出、源视频与缓存逐字节一致且分块时间戳完全对齐；不通过就不开始训练。
 - 只用训练集拟合"常量帧参考"，不在验证集上拟合任何统计量。
 - `--resume` 恢复优化器、步数、采样器与分块生成器、CPU/CUDA 随机状态；**checkpoint 的
-  架构（含输出分辨率）是权威**，与 config 的 `decoder` 段不一致会报错。
+  架构是权威**（组件 `kind`、`image_size` 与自定义 `options` 都算），与 config 的 `decoder`
+  段不一致会在第一个梯度步之前报错。
+- 架构由 `decoder.kind` 选择（默认内置 `"conv"`）。CLI 只会用**本进程已注册**的 kind：
+  要训练自定义架构，先在自己的 Python 入口 import/注册它，再调用 `wpm_video.cli.main`
+  （示例见 `examples/custom_decoder.py --via-cli`）。未注册的 kind 直接报错，不会回退。
 - 产物：`initial.pt`/`best.pt`/`final.pt`（按留出 L1）、`train_log.jsonl`、
-  `train_summary.json`（含 `l1`/`mse`/`psnr_db`、`constant_frame_reference`、`per_video`）、
+  `train_summary.json`（含 `l1`/`mse`/`psnr_db`、`constant_frame_reference`、`per_video`；
+  `decoder` 段按组件记录 `kind`/`architecture`/`parameters`/`image_size`/`grid`/`d_world`）、
   `config.json` 与 `splits.json`（写实际生效的架构与划分）。
 - 每个 batch 先在主机侧堆叠 token 与目标帧，再一次传输、一次投影；CUDA 上可开启
   `performance.pin_memory` / `non_blocking`。
 - 可选 `decoder_train.target_cache_dir` 缓存目标关键帧：命中时不解码视频，但**仍会**校验
   源文件哈希，未命中会重新解码并校验时间轴。
-- 细节与指标定义见 [decoder.md](decoder.md)，加速项见 [performance.md](performance.md)。
+- 细节与指标定义见 [decoder.md](decoder.md)，自定义架构组件见
+  [decoder_components.md](decoder_components.md)，加速项见 [performance.md](performance.md)。
 
 ## eval
 
@@ -117,7 +123,9 @@ wpm-video predict --config <config> --checkpoint <checkpoint> --video <clip.mp4>
 - 视频短于 `--prefix-chunks` 时按实际分块数处理，并在 summary 记录
   `prefix_clamped` 与 `chunks_in_video`。
 - `--decoder-checkpoint` **可选**：给出后额外把预测 latent 与真值未来 latent 解码成关键帧
-  图片。兼容性在写任何图之前检查，不匹配直接报错。
+  图片。兼容性（投影/编码器/采样/目标帧/组件架构）在写任何图之前检查，不匹配直接报错。
+  解码器按 checkpoint 记录的 `kind` 构建，因此自定义架构需要**本进程已注册**该 kind
+  （见 [decoder_components.md](decoder_components.md#注册的生命周期)）。
 - 产物：
   - `world_state.pt`：持久状态（slots、速度、float64 时钟、步数）
   - `future_latents.pt`：`{"predictions": {horizon: {...}}, "meta": {...}}`，

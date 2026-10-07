@@ -11,6 +11,11 @@
 内容不变，`predict_summary.json` / `state_query.json` 只新增 `decoded_rgb` 附加字段
 （未启用时为 `null`）。详见 [docs/decoder.md](docs/decoder.md)。
 
+RGB 解码器是**可替换组件**：`decoder.kind` 选择架构，默认卷积版（`"conv"`）保留原有
+行为与旧权重兼容性。自定义架构在包外实现、注册后，共用训练、保存、加载和渲染流程；
+`decoder.options` 保存它的设置。接入方法见 [组件文档](docs/decoder_components.md)，
+CPU 离线示例见 `examples/custom_decoder.py`。
+
 ## 安装
 
 需要 Python ≥ 3.10，且 `torch` 可用。包目录本身保持只读即可：请在**包外的目录**
@@ -20,7 +25,7 @@
 # 1) 包外环境（可复用已有的 torch，避免重复下载）
 python -m venv --system-site-packages E:\work\wpm_env
 # 2) 安装发行包
-& "E:\work\wpm_env\Scripts\python.exe" -m pip install "E:\path\to\worldline_video_model-0.4.0-py3-none-any.whl"
+& "E:\work\wpm_env\Scripts\python.exe" -m pip install "E:\path\to\worldline_video_model-0.5.0-py3-none-any.whl"
 # 3) 校验（用解释器全路径，不依赖 PATH）
 & "E:\work\wpm_env\Scripts\python.exe" -m wpm_video --version
 ```
@@ -29,7 +34,7 @@ Linux / macOS：
 
 ```bash
 python -m venv --system-site-packages ~/wpm_env
-~/wpm_env/bin/python -m pip install "/path/to/worldline_video_model-0.4.0-py3-none-any.whl"
+~/wpm_env/bin/python -m pip install "/path/to/worldline_video_model-0.5.0-py3-none-any.whl"
 ~/wpm_env/bin/python -m wpm_video --version
 ```
 
@@ -37,7 +42,7 @@ python -m venv --system-site-packages ~/wpm_env
   （构建过程中源码目录里会出现构建中间产物）。
 - 只用 native 编码器（合成视频、CPU）时，上面的安装就够了。
 - 需要真实 V-JEPA 2 编码器时，再安装可选依赖：安装 wheel 时写成
-  `"E:\path\to\worldline_video_model-0.4.0-py3-none-any.whl[vjepa]"`，或单独执行
+  `"E:\path\to\worldline_video_model-0.5.0-py3-none-any.whl[vjepa]"`，或单独执行
   `pip install "transformers>=5.15,<6" huggingface_hub`。
 - 本页后续命令统一写作 `& $py -m wpm_video`，其中 `$py` 是解释器全路径
   （`&` 是 PowerShell 调用运算符，省略它无法执行变量里的命令）。激活环境后也可以用
@@ -85,6 +90,18 @@ $py = "E:\work\wpm_env\Scripts\python.exe"
 留出视频上的 `l1`/`mse`/`psnr`，并写出 `decoded_h1.png`（预测 latent 解码）与
 `target_reconstruction_h1.png`（真值 latent 解码）等关键帧。脚本只在 `--out` 与一个
 临时目录里写文件，不会在包目录内生成任何东西。
+
+同一目录下的 `examples/custom_decoder.py` 演示**解码器组件**：它实现了一个不含任何卷积的
+第二架构（逐 cell MLP + pixel shuffle，`kind="pixelshuffle_v1"`）并注册，然后走同一条训练/
+保存/加载/渲染链路。`--out` 必填，其余完全离线：
+
+```powershell
+& $py "E:\path\to\sdist\examples\custom_decoder.py" --out E:\work\wpm_run\custom_demo
+# 也可以在注册组件后由它直接驱动 stock CLI，或同数据/同划分地跑一遍内置 conv 做对照
+& $py "E:\path\to\sdist\examples\custom_decoder.py" --out E:\work\wpm_run\custom_demo --via-cli
+& $py "E:\path\to\sdist\examples\custom_decoder.py" --out E:\work\wpm_run\custom_demo `
+    --image-size 64 --compare-conv
+```
 
 同一目录还提供 `examples/benchmark.py`：用**合成** tensor 与图像测世界模型/解码器的
 单步训练耗时（不含预训练编码器、视频 IO、评估与 checkpoint 时间），产物是 JSON 与可选
@@ -141,9 +158,10 @@ $py = "E:\work\wpm_env\Scripts\python.exe"
     --decoder-checkpoint runs\decoder\best.pt
 ```
 
-解码器与 world checkpoint 的投影、编码器身份和采样参数必须匹配，否则会在写出任何图片
-之前报错。`.pt` 解码器 checkpoint 只认本包训练出来的架构与 schema。详见
-[docs/decoder.md](docs/decoder.md)。
+解码器与 world checkpoint 的投影、编码器身份、采样参数与**组件架构**必须匹配，否则会在
+写出任何图片之前报错。解码器 checkpoint 现在写 schema 2（记录 `kind`/`options`），同时
+仍能读取、比对与续训 v0.4.0 及更早的 schema 1 文件。详见
+[docs/decoder.md](docs/decoder.md) 与 [docs/decoder_components.md](docs/decoder_components.md)。
 
 继续训练时**沿用上一个 run 的 `config.json`**（它记录了真实的 train/val 划分），
 并把 `max_steps` 调到大于 checkpoint 的 step，否则不会继续训练：
@@ -244,7 +262,9 @@ images = decode_latents(decoder, {2.0: futures[2.0]["mu"]}, device)   # {2.0: (3
 ```
 
 `decode_latents` 也会把解码器移到 `device` 再推理（并恢复调用前的模式），所以上面的
-`.to(device)` 不是必需的，但显式写出来更容易读。
+`.to(device)` 不是必需的，但显式写出来更容易读。要换架构就注册一个组件
+（`register_decoder("myarch", MyDecoder)` + `config.decoder.kind = "myarch"`），之后的调用
+完全一样，见 [docs/decoder_components.md](docs/decoder_components.md)。
 
 其中 `stream_chunks`、`predict_at` 只处理 batch 1 的状态；底层的
 `model.observe` / `model.predict` 支持 batched 状态。完整 API、张量形状与路径参数
@@ -256,6 +276,8 @@ images = decode_latents(decoder, {2.0: futures[2.0]["mu"]}, device)   # {2.0: (3
 - [docs/commands.md](docs/commands.md)：CLI 命令、参数与输出文件
 - [docs/api.md](docs/api.md)：Python API 与张量形状、单位
 - [docs/decoder.md](docs/decoder.md)：可选 RGB 解码器的架构、训练、兼容性与已知限制
+- [docs/decoder_components.md](docs/decoder_components.md)：解码器组件契约、注册、自定义架构
+  接入、checkpoint schema 与对照实验协议
 - [docs/performance.md](docs/performance.md)：可选加速项、精度契约与基准测试方法
 - [docs/releases.md](docs/releases.md)：发行版本与兼容性说明
 - [examples/prepare_sample_dataset.md](examples/prepare_sample_dataset.md)：公开样例片段下载与来源校验
@@ -265,7 +287,8 @@ images = decode_latents(decoder, {2.0: futures[2.0]["mu"]}, device)   # {2.0: (3
 ```
 src/wpm_video/   包源码（config data dataset encoder model world_state train evaluate
                  predict viz performance selfcheck cli __main__）
-src/wpm_video/decoder/  可选 RGB 解码器（model compat targets train render）
+src/wpm_video/decoder/  可选 RGB 解码器（base registry architectures/conv model compat
+                 targets train render）
 configs/         vjepa2_256.json（真实编码器）、native_tiny.json（CPU，无下载）
 examples/        无下载全链路示例、公开样例数据准备、合成基准脚本
 tests/           架构契约、端到端流水线、CLI 与来源校验、解码器、性能选项

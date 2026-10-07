@@ -9,12 +9,18 @@ The ``decoder`` and ``decoder_train`` sections configure the *optional* RGB
 decoder. They are absent from every configuration written before the decoder
 existed and default to valid values, so an old ``config.json`` loads unchanged
 and the world-model commands behave exactly as before.
+
+``decoder.kind`` and ``decoder.options`` select the decoder *component*
+(``"conv"``, the built-in convolutional upsampler, is the default). They are
+appended after the original fields, so a configuration written earlier keeps its
+exact meaning; see docs/decoder_components.md.
 """
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import MISSING, asdict, dataclass, field
 import json
 import math
 from pathlib import Path
+import re
 
 
 @dataclass
@@ -102,17 +108,30 @@ class DecoderConfig:
     image_size)`` in ``[0, 1]``. It is trained separately from the world model
     (see :class:`DecoderTrainConfig`) and is never part of the dynamics.
 
-    ``image_size`` is the output edge; the patch grid comes from the world
-    checkpoint, and ``image_size / grid_side`` must be a power of two so the
-    upsampling stages are exact. Defaults are a compact ~1.5M parameter network
-    at a 16x16 patch grid and a 128 pixel output.
+    ``kind`` selects the component that builds the network (``"conv"``, the
+    built-in convolutional upsampler, by default) and ``options`` carries
+    architecture-specific settings for it. Both fields were appended *after* the
+    original ones, so a positional ``DecoderConfig(128, 128, [1, 2, 2], 2, 1)``
+    keeps its exact meaning.
+
+    ``image_size`` is the output edge and belongs to every architecture: the
+    patch grid comes from the world checkpoint, the output must be a whole
+    multiple of it, and for the conv architecture ``image_size / grid_side``
+    must additionally be a power of two so its upsampling stages are exact. The
+    remaining fields (``base_channels``, ``channel_multipliers``,
+    ``stem_blocks``, ``blocks_per_stage``) are **conv-only**; a custom ``kind``
+    must leave them at their defaults and describe itself through ``options``.
+    Defaults are a compact ~1.5M parameter conv network at a 16x16 patch grid
+    and a 128 pixel output.
     """
 
     image_size: int = 128
     base_channels: int = 128
     channel_multipliers: list = field(default_factory=lambda: [1, 2, 2])
-    stem_blocks: int = 2         # convolutions at patch-grid resolution
-    blocks_per_stage: int = 1    # convolutions after each x2 upsample
+    stem_blocks: int = 2         # convolutions at patch-grid resolution (conv only)
+    blocks_per_stage: int = 1    # convolutions after each x2 upsample (conv only)
+    kind: str = "conv"           # registered decoder component; "conv" is the built-in
+    options: dict = field(default_factory=dict)   # kind-specific, JSON-compatible
 
 
 @dataclass
@@ -315,20 +334,140 @@ class RunConfig:
         return config
 
 
-def validate_decoder_config(decoder: DecoderConfig,
-                            settings: "DecoderTrainConfig | None" = None) -> None:
-    """Architecture (and optionally optimiser) rules for the RGB decoder.
+# The built-in convolutional architecture. Every configuration written before
+# decoder kinds existed describes exactly this one, which is why a missing kind is
+# read as "conv" rather than as "unknown".
+CONV_DECODER_KIND = "conv"
 
-    Called by ``RunConfig.validate`` and by the decoder module itself, so the direct
-    API (``build_decoder``/``load_decoder``) enforces the same rules as a
-    configuration file. The grid-relative check (``image_size`` divided by the patch
-    grid must be a power of two) needs the encoder's patch count, so it runs in
-    ``build_decoder`` instead.
+# Kind names are lowercase identifiers: they appear in configuration files, in
+# checkpoint metadata and in error messages, so a stable, boring syntax beats
+# accepting everything that happens to be a string.
+DECODER_KIND_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+
+# Architecture fields of the built-in conv decoder, in the order they were written
+# before decoder kinds existed.
+CONV_ARCHITECTURE_FIELDS = ("image_size", "base_channels", "channel_multipliers",
+                            "stem_blocks", "blocks_per_stage")
+
+
+def validate_decoder_kind(kind) -> str:
+    """Validate a decoder kind name and return it unchanged.
+
+    Pure syntax: whether the kind is *registered* is a question for the registry,
+    which is why a configuration can be loaded and validated in a process that never
+    imports a custom architecture.
     """
-    if type(decoder.image_size) is not int or not 32 <= decoder.image_size <= 2048:
-        raise ValueError("decoder.image_size must be an integer in [32, 2048]")
-    if decoder.image_size % 8:
-        raise ValueError("decoder.image_size must be a multiple of 8")
+    if not isinstance(kind, str) or not DECODER_KIND_PATTERN.match(kind):
+        raise ValueError(
+            f"decoder.kind must be a lowercase identifier matching "
+            f"{DECODER_KIND_PATTERN.pattern!r} (the built-in architecture is "
+            f"{CONV_DECODER_KIND!r}), got {kind!r}"
+        )
+    return kind
+
+
+def _check_option_value(value, path: str, seen: set) -> None:
+    """One option value must survive a JSON round trip with the same types."""
+    if value is None or isinstance(value, (bool, str)) or type(value) is int:
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"decoder.options{path} must be finite, got {value!r}")
+        return
+    if isinstance(value, (dict, list)):
+        if id(value) in seen:
+            raise ValueError(f"decoder.options{path} contains a cycle and cannot be serialized")
+        seen.add(id(value))
+        items = value.items() if isinstance(value, dict) else enumerate(value)
+        for key, item in items:
+            if isinstance(value, dict) and not isinstance(key, str):
+                raise ValueError(f"decoder.options{path} keys must be strings, got {key!r}")
+            _check_option_value(item, f"{path}['{key}']" if isinstance(value, dict)
+                                else f"{path}[{key}]", seen)
+        seen.discard(id(value))
+        return
+    raise ValueError(
+        f"decoder.options{path} must be a JSON value (dict, list, string, finite number, "
+        f"boolean or null); tuples, sets, tensors and objects are refused because they do "
+        f"not survive a checkpoint round trip, got {type(value).__name__}"
+    )
+
+
+def validate_decoder_options(kind: str, options) -> dict:
+    """Validate the kind-specific options and return a canonical JSON copy.
+
+    Options are recorded in configuration files, checkpoints and summaries, so they
+    have to survive a JSON round trip with unchanged types: plain ``dict``/``list``
+    containers with string keys and finite numbers, nothing that would come back as
+    something else. The returned value is that round trip, which also detaches it
+    from the caller.
+    """
+    if not isinstance(options, dict):
+        raise ValueError(
+            f"decoder.options must be a dict of {kind!r} architecture settings, got "
+            f"{type(options).__name__}"
+        )
+    _check_option_value(options, "", set())
+    return json.loads(json.dumps(options))
+
+
+def decoder_architecture(config: "DecoderConfig") -> dict:
+    """Canonical architecture record of a decoder configuration.
+
+    Used to compare a configuration against a checkpoint: two configurations with the
+    same record build the same network, and any difference has to be resolved before
+    training rather than discovered as a shape error later. The record always names
+    the component kind, so a conv decoder can never be swapped for a different
+    architecture that happens to share its output size.
+
+    Architecture options live in their own ``options`` block -- namespaced, so an
+    option called ``kind`` or ``grid`` is simply that architecture's business and can
+    never shadow the shared identity. ``kind`` names the *implementation*, including
+    its semantics: an author who changes what a kind computes must publish it under a
+    new name (``my_decoder_v2``) rather than changing the meaning of the old one, see
+    docs/decoder_components.md.
+    """
+    kind = validate_decoder_kind(config.kind)
+    if kind == CONV_DECODER_KIND:
+        return {
+            "kind": CONV_DECODER_KIND,
+            "image_size": int(config.image_size),
+            "base_channels": int(config.base_channels),
+            "channel_multipliers": [int(value) for value in config.channel_multipliers],
+            "stem_blocks": int(config.stem_blocks),
+            "blocks_per_stage": int(config.blocks_per_stage),
+        }
+    return {
+        "kind": kind,
+        "image_size": int(config.image_size),
+        "options": validate_decoder_options(kind, config.options),
+    }
+
+
+def _conv_field_defaults() -> dict:
+    """Defaults of the conv-only shape fields (what an unused field must still equal)."""
+    defaults = {}
+    for name in ("base_channels", "channel_multipliers", "stem_blocks", "blocks_per_stage"):
+        field_ = DecoderConfig.__dataclass_fields__[name]
+        value = field_.default
+        if value is MISSING:
+            value = field_.default_factory()
+        defaults[name] = value
+    return defaults
+
+
+def decoder_config_snapshot(config: DecoderConfig) -> dict:
+    """A JSON-safe copy of a decoder configuration, options included.
+
+    Checkpoints, summaries and the module itself must never keep a live reference to
+    a caller-owned options mapping: the copy is what makes an edited dictionary
+    afterwards unable to change what was trained or recorded.
+    """
+    return asdict(config)
+
+
+def _validate_conv_architecture(decoder: DecoderConfig) -> None:
+    """Shape fields of the built-in conv architecture."""
     if type(decoder.base_channels) is not int or not 1 <= decoder.base_channels <= 2048:
         raise ValueError("decoder.base_channels must be an integer in [1, 2048]")
     if not decoder.channel_multipliers:
@@ -342,6 +481,57 @@ def validate_decoder_config(decoder: DecoderConfig,
         value = getattr(decoder, name)
         if type(value) is not int or value < 1:
             raise ValueError(f"decoder.{name} must be an integer >= 1")
+
+
+def _reject_conv_fields(decoder: DecoderConfig) -> None:
+    """A custom kind must leave the conv shape fields at their defaults.
+
+    They take part neither in the identity of a custom architecture nor in the
+    network it builds, so accepting a changed value would record a setting that
+    silently does nothing.
+    """
+    used = sorted(name for name, default in _conv_field_defaults().items()
+                  if getattr(decoder, name) != default)
+    if used:
+        names = ", ".join(f"decoder.{name}" for name in used)
+        raise ValueError(
+            f"{names} only configure kind {CONV_DECODER_KIND!r} and are ignored by kind "
+            f"{decoder.kind!r}; describe that architecture through decoder.options instead "
+            "(leave the conv fields at their defaults)"
+        )
+
+
+def validate_decoder_config(decoder: DecoderConfig,
+                            settings: "DecoderTrainConfig | None" = None) -> None:
+    """Architecture (and optionally optimiser) rules for the RGB decoder.
+
+    Called by ``RunConfig.validate`` and by the decoder module itself, so the direct
+    API (``build_decoder``/``load_decoder``) enforces the same rules as a
+    configuration file. Grid-relative rules (the output covering the patch grid, and
+    for conv the power-of-two upsampling factor) need the encoder's patch count, so
+    they run when the module is built instead.
+
+    The shared fields (``image_size``, ``kind``, ``options``) are checked for every
+    architecture; the conv shape fields are checked for ``kind == "conv"`` and
+    refused as unused for any other kind, so a configuration can never describe a
+    network that is not the one that will be built.
+    """
+    validate_decoder_kind(decoder.kind)
+    if type(decoder.image_size) is not int or not 32 <= decoder.image_size <= 2048:
+        raise ValueError("decoder.image_size must be an integer in [32, 2048]")
+    if decoder.image_size % 8:
+        raise ValueError("decoder.image_size must be a multiple of 8")
+    options = validate_decoder_options(decoder.kind, decoder.options)
+    if decoder.kind == CONV_DECODER_KIND:
+        if options:
+            raise ValueError(
+                f"decoder.options must be empty for kind {CONV_DECODER_KIND!r}: the conv "
+                f"architecture is configured by base_channels, channel_multipliers, "
+                f"stem_blocks and blocks_per_stage, got {sorted(options)}"
+            )
+        _validate_conv_architecture(decoder)
+    else:
+        _reject_conv_fields(decoder)
     if settings is None:
         return
     if type(settings.seed) is not int or settings.seed < 0:
@@ -388,19 +578,3 @@ def validate_performance_config(performance: PerformanceConfig) -> None:
     for name in ("fused_optimizer", "compile", "compile_fallback", "pin_memory", "non_blocking"):
         if not isinstance(getattr(performance, name), bool):
             raise ValueError(f"performance.{name} must be a boolean")
-
-
-def decoder_architecture(config: "DecoderConfig") -> dict:
-    """The architecture fields that define a decoder's parameter shapes.
-
-    Used to compare a configuration against a checkpoint: two configurations with the
-    same dictionary build the same network, and any difference has to be resolved
-    before training rather than discovered as a shape error later.
-    """
-    return {
-        "image_size": int(config.image_size),
-        "base_channels": int(config.base_channels),
-        "channel_multipliers": [int(value) for value in config.channel_multipliers],
-        "stem_blocks": int(config.stem_blocks),
-        "blocks_per_stage": int(config.blocks_per_stage),
-    }

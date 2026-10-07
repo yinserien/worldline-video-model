@@ -8,6 +8,9 @@ chunk length or source image size silently changes the token distribution too.
 Matching dimensions are therefore never enough, so a decoder checkpoint records
 
 - the shape it consumes (``d_world``, patch count and grid),
+- the component architecture that produced it (``kind``, its options and the
+  canonical architecture record), so a different architecture with the same output
+  size can never be mistaken for the one that was trained,
 - a SHA-256 fingerprint of the world projection buffers (weight, mean, std),
 - the encoder identity (kind, model id, revision, width, patch count),
 - the sampling/preprocessing it was trained with (fps, chunking, token image
@@ -29,7 +32,10 @@ from pathlib import Path
 import torch
 
 from ..config import DataConfig, EncoderConfig, RunConfig, decoder_architecture
-from .model import DECODER_SCHEMA_VERSION, LatentRGBDecoder
+from .base import RGBDecoder
+from .model import (SUPPORTED_DECODER_SCHEMA_VERSIONS, checkpoint_component_kind,
+                    checkpoint_schema_version, decoder_config_from_payload,
+                    normalize_architecture_record)
 
 # Bumping this string invalidates every decoder checkpoint: it is the contract of
 # what an RGB target *is*, not a formatting detail.
@@ -128,7 +134,7 @@ def sampling_identity(data: DataConfig, model=None) -> dict:
     }
 
 
-def decoder_identity(decoder: LatentRGBDecoder, model, config: RunConfig) -> dict:
+def decoder_identity(decoder: RGBDecoder, model, config: RunConfig) -> dict:
     """Everything a compatibility check needs, as stored in a decoder checkpoint."""
     return {
         "world_projection": projection_fingerprint(model),
@@ -137,10 +143,20 @@ def decoder_identity(decoder: LatentRGBDecoder, model, config: RunConfig) -> dic
         "frame_target": {
             "semantics": TARGET_SEMANTICS,
             "role": "last sampled frame of the chunk",
-            "resolution": int(decoder.config.image_size),
+            "resolution": int(decoder.output_size),
             "range": "[0, 1] float, uint8 PNG",
         },
     }
+
+
+def stored_architecture(payload: Mapping, source=None) -> dict:
+    """Canonical architecture record of a checkpoint (schema 1 = the legacy conv one).
+
+    Kept next to the compatibility checks so a caller comparing a checkpoint with a
+    configuration uses the same normalization the loader does, including its refusal
+    to repair a malformed record.
+    """
+    return normalize_architecture_record(payload, checkpoint_schema_version(payload), source)
 
 
 def identity_gaps(payload: Mapping) -> list:
@@ -148,11 +164,17 @@ def identity_gaps(payload: Mapping) -> list:
     gaps = []
     if not isinstance(payload, Mapping):
         return ["checkpoint is not a mapping"]
-    if payload.get("schema_version") != DECODER_SCHEMA_VERSION:
+    version = checkpoint_schema_version(payload)
+    if version is None:
         gaps.append(
-            f"schema_version {payload.get('schema_version')!r} is not the supported "
-            f"{DECODER_SCHEMA_VERSION}"
+            f"schema_version {payload.get('schema_version')!r} is not one of the supported "
+            f"{list(SUPPORTED_DECODER_SCHEMA_VERSIONS)}"
         )
+    if not isinstance(payload.get("decoder_config"), Mapping):
+        gaps.append("missing 'decoder_config'")
+    kind = checkpoint_component_kind(payload)
+    if kind is None:
+        gaps.append("missing 'decoder_config.kind'")
     for section, fields in IDENTITY_FIELDS.items():
         stored = payload.get(section)
         if not isinstance(stored, Mapping):
@@ -165,11 +187,23 @@ def identity_gaps(payload: Mapping) -> list:
         gaps.append("missing d_world/patches")
     if not payload.get("architecture"):
         gaps.append("missing 'architecture'")
+    else:
+        try:
+            stored_architecture(payload)
+        except ValueError as error:
+            gaps.append(str(error))
+    if version in SUPPORTED_DECODER_SCHEMA_VERSIONS and kind is not None:
+        recorded = payload.get("architecture") or {}
+        if isinstance(recorded, Mapping) and recorded.get("kind") not in (None, kind):
+            gaps.append(
+                f"'decoder_config.kind' ({kind!r}) and 'architecture.kind' "
+                f"({recorded.get('kind')!r}) disagree"
+            )
     return gaps
 
 
 def check_decoder_compatibility(payload: dict, model, config: RunConfig,
-                                decoder: LatentRGBDecoder | None = None) -> dict:
+                                decoder: RGBDecoder | None = None) -> dict:
     """Reject a decoder that does not match this world model and configuration.
 
     Collects every mismatch and raises once, so a user sees all the reasons in a
@@ -229,15 +263,44 @@ def check_decoder_compatibility(payload: dict, model, config: RunConfig,
             "target frame semantics changed since this decoder was trained; retrain it "
             "(the recorded semantics no longer describe what a target image is)"
         )
+    # the checkpoint must be internally consistent even when no module is compared:
+    # its architecture record has to describe the configuration it also records
+    recorded_architecture = None
+    stored_kind = checkpoint_component_kind(payload)
+    try:
+        recorded_config = decoder_config_from_payload(payload, checkpoint_schema_version(payload),
+                                                      "this decoder checkpoint")
+        recorded_architecture = stored_architecture(payload)
+    except ValueError as error:
+        reasons.append(str(error))
+    else:
+        expected = decoder_architecture(recorded_config)
+        if recorded_architecture != expected:
+            reasons.append(
+                f"decoder architecture differs from the decoder_config the checkpoint records: "
+                f"architecture={recorded_architecture}, decoder_config={expected}"
+            )
     if decoder is not None:
-        if payload["frame_target"]["resolution"] != int(decoder.config.image_size):
+        if payload["frame_target"]["resolution"] != int(decoder.output_size):
             reasons.append(
                 f"frame target resolution differs: checkpoint={payload['frame_target']['resolution']}, "
-                f"module={decoder.config.image_size}"
+                f"module={decoder.output_size}"
             )
-        if payload.get("architecture") != decoder_architecture(decoder.config):
+        if stored_kind is None:
             reasons.append(
-                f"decoder architecture differs: checkpoint={payload.get('architecture')}, "
+                "this checkpoint does not record which decoder architecture produced it, so it "
+                "cannot be matched against a module"
+            )
+        elif stored_kind != decoder.kind:
+            # a different kind is a different component, whatever the shapes say
+            reasons.append(
+                f"decoder component kind differs: checkpoint={stored_kind!r}, "
+                f"module={decoder.kind!r}"
+            )
+        elif recorded_architecture is not None and recorded_architecture != \
+                decoder_architecture(decoder.config):
+            reasons.append(
+                f"decoder architecture differs: checkpoint={recorded_architecture}, "
                 f"module={decoder_architecture(decoder.config)}"
             )
     if reasons:
@@ -355,6 +418,7 @@ def decoder_fingerprint(payload: dict) -> dict:
     projection = payload.get("world_projection") or {}
     return {
         "kind": payload.get("kind"),
+        "component_kind": checkpoint_component_kind(payload),
         "schema_version": payload.get("schema_version"),
         "d_world": payload.get("d_world"),
         "patches": payload.get("patches"),

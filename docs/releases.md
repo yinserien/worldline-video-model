@@ -1,5 +1,20 @@
 # 发行记录
 
+## 0.5.0
+
+RGB decoder 成为可替换组件：`RGBDecoder` 定义输入输出契约，`register_decoder` 显式注册
+架构，`DecoderConfig.kind` 选择实现，`options` 保存自定义设置。具体架构放在
+`decoder/architectures/`，构建、checkpoint、身份校验、训练和渲染各有独立职责。
+
+- 默认 `conv` 保持原有网络、参数名、参数量与初始化顺序；旧配置和旧导入路径继续可用。
+- 新 checkpoint 写入 schema 2，继续读取 schema 1 的卷积权重并支持续训；拒绝组件、架构、
+  投影或采样身份不匹配。附加元数据不能覆盖格式字段。
+- 自定义组件由调用者在本进程注册后使用，共用训练、评估、保存、加载和渲染流程。
+  新增 CPU 离线示例与[组件接入文档](decoder_components.md)。
+
+本次更新提供架构替换能力；示例的合成数据结果不代表真实数据上的清晰度收益。
+发行包仅包含通用代码、文档、示例与测试；实验配置、数据、日志和权重由调用者在包外管理。
+
 ## 0.4.0
 
 新增可选 `performance.compile_scope="training_blocks"`：对完整动力学子步循环、anchor 写入、

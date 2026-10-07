@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 import torch
 
+from .base import _check_rgb_output
 from .compat import decoder_fingerprint
 
 SAFE = re.compile(r"[^0-9A-Za-z._-]+")
@@ -40,10 +41,17 @@ def decode_latents(decoder, latents: dict, device) -> dict:
     was_training = decoder.training
     decoder.to(device).eval()
     images = {}
-    for key, latent in latents.items():
-        batch = latent.unsqueeze(0) if latent.dim() == 2 else latent
-        images[key] = decoder(batch.to(device).float())[0].detach().cpu()
-    decoder.train(was_training)
+    try:
+        for key, latent in latents.items():
+            batch = latent.unsqueeze(0) if latent.dim() == 2 else latent
+            pixels = decoder(batch.to(device).float())
+            _check_rgb_output(pixels, batch.shape[0], getattr(decoder, "output_size", None))
+            pixels = pixels.detach().cpu()
+            _check_rgb_output(pixels, batch.shape[0], getattr(decoder, "output_size", None),
+                              check_values=True)
+            images[key] = pixels[0]
+    finally:
+        decoder.train(was_training)
     return images
 
 

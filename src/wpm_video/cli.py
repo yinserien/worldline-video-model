@@ -62,8 +62,8 @@ def _load_optional_decoder(args, model, config: RunConfig, device):
         return None, None
     decoder, payload = load_decoder(Path(path), map_location="cpu")
     check_decoder_compatibility(payload, model, config, decoder)
-    if int(config.decoder.image_size) != int(decoder.config.image_size):
-        print(f"note: the decoder checkpoint outputs {decoder.config.image_size}px; "
+    if int(config.decoder.image_size) != int(decoder.output_size):
+        print(f"note: the decoder checkpoint ({decoder.kind}) outputs {decoder.output_size}px; "
               f"config.decoder.image_size ({config.decoder.image_size}) only applies to training",
               flush=True)
     return decoder.to(device), payload

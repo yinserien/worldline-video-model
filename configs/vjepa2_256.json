@@ -67,7 +67,9 @@
       2
     ],
     "stem_blocks": 2,
-    "blocks_per_stage": 1
+    "blocks_per_stage": 1,
+    "kind": "conv",
+    "options": {}
   },
   "decoder_train": {
     "seed": 0,

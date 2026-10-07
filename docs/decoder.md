@@ -19,15 +19,23 @@
 
 ```
 src/wpm_video/decoder/
-    model.py     LatentRGBDecoder 架构、构建/加载、参数与形状校验
-    compat.py    投影指纹、编码器/采样身份、兼容性检查
-    targets.py   目标帧读取（按视频有界惰性缓存）与时间轴对齐校验
-    train.py     独立的解码器训练/评价/产物
-    render.py    latent -> PNG 与张量产物的共享渲染助手
+    base.py              RGBDecoder 基类：组件契约与共享几何校验
+    registry.py          register_decoder / available_decoders / build_decoder 按 kind 分发
+    architectures/conv.py 内置 conv 架构（kind="conv"），导入即注册
+    model.py             checkpoint 格式（schema 1/2）与 save/load；旧的 LatentRGBDecoder、
+                         build_decoder、group_count 等导入路径仍然有效
+    compat.py            投影指纹、编码器/采样身份、兼容性检查
+    targets.py           目标帧读取（按视频有界惰性缓存）与时间轴对齐校验
+    train.py             独立的解码器训练/评价/产物
+    render.py            latent -> PNG 与张量产物的共享渲染助手
 ```
 
 动力学（`model.py`、`world_state.py`、`train.py`）**不 import** 这个子包；解码只发生在
 推理末尾，作用于已经算好的 latent。
+
+解码器是**可替换组件**：`config.decoder.kind` 选择一个已注册的架构，内置的
+`"conv"`（就是下面这个卷积上采样器）是默认值。要接入第二种架构，见
+[decoder_components.md](decoder_components.md)；本文余下的内容描述的都是这个默认架构。
 
 ## 架构与参数量
 
@@ -41,11 +49,15 @@ src/wpm_video/decoder/
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `image_size` | `128` | 输出边长，必须是 8 的倍数，且为 patch 网格边长的 2 的幂倍 |
-| `base_channels` | `128` | stem 与第一级通道数 |
-| `channel_multipliers` | `[1, 2, 2]` | 各级通道倍率；级数由 `image_size / 网格边长` 决定，超出的级复用最后一项 |
-| `stem_blocks` | `2` | 网格分辨率上的卷积层数 |
-| `blocks_per_stage` | `1` | 每次上采样后的卷积层数 |
+| `kind` | `"conv"` | 组件架构；`"conv"` 是内置且默认的这一个，其他取值见 [decoder_components.md](decoder_components.md) |
+| `options` | `{}` | 该架构自己的设置；**conv 必须为空**（conv 用下面四个字段配置） |
+| `image_size` | `128` | 输出边长，必须是 8 的倍数；conv 进一步要求它是 patch 网格边长的 2 的幂倍（自定义架构的几何约束由架构自己定） |
+| `base_channels` | `128` | stem 与第一级通道数（仅 conv） |
+| `channel_multipliers` | `[1, 2, 2]` | 各级通道倍率；级数由 `image_size / 网格边长` 决定，超出的级复用最后一项（仅 conv） |
+| `stem_blocks` | `2` | 网格分辨率上的卷积层数（仅 conv） |
+| `blocks_per_stage` | `1` | 每次上采样后的卷积层数（仅 conv） |
+
+`kind` 与 `options` 追加在原有字段之后，位置参数写法与旧配置文件的含义都不变。
 
 参数量（16x16 patch 网格、128 像素输出，含位置嵌入）：
 
@@ -85,9 +97,17 @@ wpm-video train-decoder --config <config> --checkpoint <world 的 best.pt> --out
   架构与划分。
 - `--resume` 恢复优化器、步数、采样器/分块生成器与 CPU/CUDA 随机状态；**checkpoint 的
   架构是权威**，config 与它不一致会直接报错（否则会记录一套配置却训练另一个网络）。
-  续训还会比对 `performance` 的语义项（精度/注意力核/fused/compile），不一致时报错；
-  decoder 始终不编译，世界模型的 `compile_scope` 不会启用 decoder 编译。
-  旧版本写的 checkpoint 没有该记录，视为参考策略。
+  比对的架构是**规范化记录**：组件 `kind`、`image_size` 与自定义 `options` 都包含在内，
+  任何差异都在第一个梯度步之前拒绝。续训还会比对 `performance` 的语义项（精度/注意力核/
+  fused/compile），不一致时报错；decoder 始终不编译，世界模型的 `compile_scope` 不会启用
+  decoder 编译。旧版本写的 checkpoint 没有该记录，视为参考策略。
+- `train_summary.json` 的 `decoder` 段按**组件**记录：`kind`、`architecture`（含 options）、
+  `parameters`、`image_size`、`grid`、`d_world`——不再假定 conv 的 `base_channels` /
+  `channel_multipliers` 存在。
+- checkpoint 现在写 **schema 2**（记录 `kind`/`options`）；v0.4.0 及更早的 **schema 1**
+  仍可读取、比对与续训，它只可能描述内置 conv，因此按"旧 conv"解释而不是按形状猜测。
+  未知/未来 schema、未知 kind、被改写的元数据都会在产生像素或梯度之前报错。详见
+  [decoder_components.md](decoder_components.md#checkpoint-格式与兼容)。
 
 - 可选的目标关键帧磁盘缓存：`decoder_train.target_cache_dir`（默认空 = 关闭）。只保存每个
   分块**最后一帧**（不保存整段视频），按来源 SHA-256、时间轴 schema、采样帧率与栅格、分块
@@ -110,7 +130,9 @@ wpm-video query   --config <config> --checkpoint <world checkpoint> --state <sta
 ```
 
 - 解码前先做兼容性检查：投影 buffer 指纹、`d_world`、patch 网格、编码器身份、采样参数、
-  目标帧语义与分辨率。**维度相同但投影不同会被拒绝**；不兼容时不会写出任何一张图。
+  目标帧语义与分辨率，以及**组件 kind 与规范化架构**。**维度相同但投影不同、或架构不同，
+  都会被拒绝**；不兼容时不会写出任何一张图。加载自定义架构的 checkpoint 需要该进程已注册
+  对应 kind（见 [decoder_components.md](decoder_components.md#注册的生命周期)）。
   采样身份只包含 `timeline_schema`、`fps`、`chunk_frames`、`chunk_stride_frames`、
   `image_size`、`patches`：`context_chunks` 属于世界模型的观测窗口，只作为 provenance
   记录，改它不会让已有解码器失效。
@@ -152,4 +174,8 @@ wpm-video query   --config <config> --checkpoint <world checkpoint> --state <sta
 - 解码器只见过"真实分块 latent"，作用在"预测 mu"上时误差 = 预测误差 + 解码误差，两者在
   产物里分开报告；
 - 输出分辨率是配置项，但不会超过训练时使用的分辨率所带来的细节上限；
-- 单卡 CPU/单 GPU 的线性训练路径，没有分布式、混合精度或 GAN 精修。
+- 默认基线只有逐像素与边缘监督：不含 GAN / diffusion / 感知损失，也没有自定义算子。
+  想要更锐利的画面需要换架构或换目标，属于**后续要按对照协议测量**的实验，见
+  [decoder_components.md](decoder_components.md#对照实验协议)；
+- 单卡 CPU/单 GPU 的线性训练路径，没有分布式；混合精度由 `performance.precision` 控制
+  （见 [performance.md](performance.md)），decoder 不做 `torch.compile`。
