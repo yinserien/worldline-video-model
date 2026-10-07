@@ -4,8 +4,9 @@ Everything in this module defaults to the reference FP32 path and is opt-in. Thr
 rules shape it:
 
 - **explicit or nothing.** A request that the platform cannot honour raises
-  ``PerformanceError`` with the reason; it is never silently downgraded, and the
-  effective settings are written into the checkpoint that used them.
+  ``PerformanceError`` unless setup-only ``compile_fallback`` is explicitly allowed.
+  That fallback warns and records the reference policy; runtime failures abort.
+  Effective settings are written into the checkpoint that used them.
 - **numerics stay interpretable.** Reduced precision applies to model *compute*
   only. The persistent state stays float32, clocks stay float64, and every reported
   number (Gaussian NLL/KL, projection standardisation, pixel metrics) is computed in
@@ -22,6 +23,7 @@ option off.
 
 import contextlib
 import sys
+import warnings
 
 import torch
 
@@ -199,6 +201,38 @@ class _GuardedCallable:
 
 
 def apply_compile(model, performance, compile_fn=None) -> dict:
+    """Apply the requested scope atomically; optional setup-only reference fallback.
+
+    A runtime/backend or backward failure after setup always aborts. Changing the
+    effective policy halfway through training could invalidate a checkpoint.
+    """
+    performance = settings(performance)
+    model.compiled_predictor = None
+    model.compiled_training = None
+    try:
+        status = (_apply_training_blocks(model, performance, compile_fn)
+                  if performance.compile and performance.compile_scope == "training_blocks"
+                  else _apply_predictor_compile(model, performance, compile_fn))
+    except PerformanceError as error:
+        if not performance.compile_fallback:
+            raise
+        model.compiled_predictor = None
+        model.compiled_training = None
+        status = {"compile": bool(performance.compile), "applied": False, "verified": False,
+                  "state": "fallback", "targets": [], "backend": sys.platform, "reason": str(error)}
+        warnings.warn(f"Compilation preflight failed; using the reference implementation: {error}",
+                      RuntimeWarning, stacklevel=2)
+    status["requested_scope"] = performance.compile_scope
+    status["scope"] = performance.compile_scope if status["applied"] else "none"
+    return status
+
+
+def _apply_training_blocks(model, performance, compile_fn):
+    from .compiled_training import apply_training_blocks
+    return apply_training_blocks(model, performance, compile_fn or torch.compile)
+
+
+def _apply_predictor_compile(model, performance, compile_fn=None) -> dict:
     """Attach a compiled copy of the model's predictor head, or report why not.
 
     Returns a status record with ``applied``/``reason``/``targets``. Compilation is
@@ -344,6 +378,7 @@ REFERENCE_POLICY = {
     "anchor_attention": "reference",
     "fused": False,
     "compile": False,
+    "compile_scope": "none",
     "optimizer_name": "AdamW",
 }
 
@@ -351,7 +386,7 @@ REFERENCE_POLICY = {
 #: how the optimiser updates it. Everything else a checkpoint records (device, pinned
 #: transfers, verbose compile status, dtype bookkeeping) describes *where* or *how
 #: fast* a run happened, and must not block a legitimate cross-device resume.
-COMPARABLE_POLICY_KEYS = ("precision", "anchor_attention", "fused", "compile")
+COMPARABLE_POLICY_KEYS = ("precision", "anchor_attention", "fused", "compile", "compile_scope")
 
 
 def comparable_policy(policy: dict | None) -> dict:
@@ -364,6 +399,8 @@ def comparable_policy(policy: dict | None) -> dict:
     if not policy:
         return {}
     flat = {key: policy[key] for key in COMPARABLE_POLICY_KEYS if key in policy}
+    if "compile" in flat:
+        flat["compile_scope"] = policy.get("compile_scope", "predictor") if flat["compile"] else "none"
     optimizer = policy.get("optimizer")
     if isinstance(optimizer, dict):
         if "name" in optimizer:
@@ -420,5 +457,6 @@ def training_policy(performance, model, device, compile_status: dict | None = No
         "anchor_attention": getattr(model, "anchor_attention", "reference"),
         "fused": optimizer_policy(performance, device)["fused"],
         "compile": bool((compile_status or {}).get("applied", False)),
+        "compile_scope": (compile_status or {}).get("scope", "predictor" if (compile_status or {}).get("applied") else "none"),
         "pin_memory": should_pin(performance, device),
     }

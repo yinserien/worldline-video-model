@@ -163,13 +163,15 @@ config.validate()                        # load 时已自动调用
 | `precision` | `float32` | `float32` 或 `bfloat16`（bfloat16 只需 `torch.autocast`，不需要 loss scaler） |
 | `anchor_attention` | `reference` | `reference`（返回注意力权重）或 `sdpa`（融合核，不返回权重） |
 | `fused_optimizer` | `false` | 布尔；仅 CUDA 可用，CPU 上请求会报错而不是静默退回 |
-| `compile` | `false` | 布尔；只编译 predictor head，是否可用取决于 torch 版本/后端/平台 |
+| `compile` | `false` | 布尔；启用所选编译范围，是否可用取决于 torch 版本/后端/平台 |
+| `compile_scope` | `predictor` | `predictor` 或 `training_blocks`；后者融合动力学循环、anchor 写入和 NLL/KL，0.4.0 新增 |
+| `compile_fallback` | `false` | 仅设置阶段允许明确警告并记录参考回退，0.4.0 新增；启动后编译失败仍停止 |
 | `pin_memory` | `false` | 布尔；仅 CUDA 生效 |
 | `non_blocking` | `false` | 布尔；仅 CUDA 生效 |
 
 无论怎么设置：持久状态是 FP32、时钟是 float64、概率/投影/标准化与所有上报指标在 FP32
 计算，冻结编码器的 cache 保持 FP32 且缓存键不变。检查点记录实际生效的策略，续训时语义项
-（精度/注意力核/fused/compile）改变会被拒绝，设备与 pinned 传输等元数据差异不会。
+（精度/注意力核/fused/compile/生效编译范围）改变会被拒绝，设备与 pinned 传输等元数据差异不会。
 
 ## 检查点与状态
 

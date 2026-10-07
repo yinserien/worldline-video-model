@@ -270,7 +270,7 @@ class OptimizerPolicyTests(unittest.TestCase):
         self.assertIsNone(resume_policy_error(recorded, current, "performance"))
         self.assertEqual(comparable_policy(current),
                          {"precision": "float32", "anchor_attention": "reference", "compile": False,
-                          "fused": False, "optimizer_name": "AdamW"})
+                          "fused": False, "optimizer_name": "AdamW", "compile_scope": "none"})
         # ... while the semantic entries, including a nested optimiser policy, are not
         for change, expected in (({"optimizer": {"name": "SGD"}}, "optimizer_name"),
                                  ({"optimizer": {"name": "AdamW", "fused": True}}, "fused"),

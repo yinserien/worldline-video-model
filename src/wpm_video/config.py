@@ -141,8 +141,8 @@ class PerformanceConfig:
 
     Nothing here changes results by itself: a run with the defaults does exactly what
     earlier versions did. Each option is explicit, recorded in the checkpoints that
-    were produced with it, and refused (rather than silently downgraded) when the
-    running platform cannot honour it.
+    were produced with it, and refused when the platform cannot honour it. An
+    explicitly allowed compile setup fallback warns and records the reference path.
 
     ``precision`` applies to model *compute* only: the persistent state stays
     float32, clocks stay float64, and the Gaussian NLL/KL, the projection
@@ -162,6 +162,8 @@ class PerformanceConfig:
     compile: bool = False                 # torch.compile on selected pure hot paths
     pin_memory: bool = False              # pinned host buffers + non-blocking copies
     non_blocking: bool = False            # async H2D; implied by pin_memory on CUDA
+    compile_scope: str = "predictor"      # predictor | training_blocks
+    compile_fallback: bool = False        # allow explicit reference fallback at setup only
 
 
 @dataclass
@@ -381,7 +383,9 @@ def validate_performance_config(performance: PerformanceConfig) -> None:
     if performance.anchor_attention not in ATTENTION_MODES:
         raise ValueError(f"performance.anchor_attention must be one of "
                          f"{sorted(ATTENTION_MODES)}, got {performance.anchor_attention!r}")
-    for name in ("fused_optimizer", "compile", "pin_memory", "non_blocking"):
+    if performance.compile_scope not in ("predictor", "training_blocks"):
+        raise ValueError("performance.compile_scope must be predictor or training_blocks")
+    for name in ("fused_optimizer", "compile", "compile_fallback", "pin_memory", "non_blocking"):
         if not isinstance(getattr(performance, name), bool):
             raise ValueError(f"performance.{name} must be a boolean")
 

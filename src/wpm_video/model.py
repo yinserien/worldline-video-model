@@ -231,6 +231,7 @@ class VideoWorldModel(nn.Module):
         self.anchor_attention = anchor_attention
         # not a submodule: ``apply_compile`` may replace it without touching state_dict
         self.compiled_predictor = None
+        self.compiled_training = None  # plain callable dict, never a registered module
         d = config.d_world
         grid_side = int(round(math.sqrt(patches)))
         if grid_side * grid_side != patches:
@@ -309,6 +310,24 @@ class VideoWorldModel(nn.Module):
         """The predictor head, compiled if the performance hook installed one."""
         compiled = getattr(self, "compiled_predictor", None)
         return compiled if compiled is not None else self.predictor
+
+    def _write(self, slots, tokens, coordinates):
+        compiled = getattr(self, "compiled_training", None)
+        return (compiled["write"](slots, tokens, coordinates) if compiled is not None
+                else self.anchors.write(slots, tokens, coordinates))
+
+    def _nll(self, target, mu, logvar, reduction="rows"):
+        compiled = getattr(self, "compiled_training", None)
+        if compiled is not None:
+            rows = compiled["nll_rows"](target, mu, logvar)
+            return rows if reduction == "rows" else (rows.mean(dim=1) if reduction == "batch" else rows.mean())
+        bits = gaussian_nll_bits(target, mu, logvar)
+        return bits.mean(dim=-1) if reduction == "rows" else (bits.mean(dim=(1, 2)) if reduction == "batch" else bits.mean())
+
+    def _kl_rows(self, mu_q, logvar_q, mu_p, logvar_p):
+        compiled = getattr(self, "compiled_training", None)
+        return (compiled["kl_rows"](mu_q, logvar_q, mu_p, logvar_p) if compiled is not None
+                else gaussian_kl_bits(mu_q, logvar_q, mu_p, logvar_p).mean(dim=-1))
 
     def project(self, tokens: torch.Tensor) -> torch.Tensor:
         return self.projection(tokens)
@@ -409,7 +428,7 @@ class VideoWorldModel(nn.Module):
         else:
             code = mu_post
         innovation = code - mu_prior
-        increment = self.anchors.write(advanced.slots, innovation, coordinates)
+        increment = self._write(advanced.slots, innovation, coordinates)
         new_state = promote_state(WorldState(
             slots=advanced.slots + increment,
             velocity=advanced.velocity + self.velocity_write * increment,
@@ -417,8 +436,8 @@ class VideoWorldModel(nn.Module):
             step=advanced.step + 1,
         ))
         diagnostics = {
-            "kl_bits_per_dim": gaussian_kl_bits(mu_post, logvar_post, mu_prior, logvar_prior).mean(dim=-1),
-            "prior_nll_bits_per_dim": gaussian_nll_bits(observation, mu_prior, logvar_prior).mean(dim=-1),
+            "kl_bits_per_dim": self._kl_rows(mu_post, logvar_post, mu_prior, logvar_prior),
+            "prior_nll_bits_per_dim": self._nll(observation, mu_prior, logvar_prior),
             "innovation_rms": innovation.pow(2).mean(dim=(1, 2)).sqrt(),
             "increment_rms": increment.pow(2).mean(dim=(1, 2)).sqrt(),
             "sampled": sample,
@@ -488,6 +507,11 @@ class VideoWorldModel(nn.Module):
         return self._advance_planned(state, delta_seconds, steps)
 
     def _advance_planned(self, state: WorldState, delta_seconds, steps: int) -> WorldState:
+        compiled = getattr(self, "compiled_training", None)
+        return (compiled["advance"](state, delta_seconds, steps) if compiled is not None
+                else self._advance_reference(state, delta_seconds, steps))
+
+    def _advance_reference(self, state: WorldState, delta_seconds, steps: int) -> WorldState:
         """Integrate with a caller-validated step count (private training path).
 
         The caller (``dataset.gather_batch``) has already checked finiteness, sign,

@@ -8,7 +8,7 @@
 
 ```powershell
 python -m venv --system-site-packages E:\work\wpm_env
-& "E:\work\wpm_env\Scripts\python.exe" -m pip install "E:\path\to\worldline_video_model-0.3.0-py3-none-any.whl[vjepa]"
+& "E:\work\wpm_env\Scripts\python.exe" -m pip install "E:\path\to\worldline_video_model-0.4.0-py3-none-any.whl[vjepa]"
 New-Item -ItemType Directory -Force E:\work\wpm_run | Out-Null
 Set-Location E:\work\wpm_run
 $py = "E:\work\wpm_env\Scripts\python.exe"

@@ -90,6 +90,8 @@
     "anchor_attention": "reference",
     "fused_optimizer": false,
     "compile": false,
+    "compile_scope": "predictor",
+    "compile_fallback": false,
     "pin_memory": false,
     "non_blocking": false
   }

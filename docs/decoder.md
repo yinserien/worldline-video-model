@@ -86,6 +86,7 @@ wpm-video train-decoder --config <config> --checkpoint <world 的 best.pt> --out
 - `--resume` 恢复优化器、步数、采样器/分块生成器与 CPU/CUDA 随机状态；**checkpoint 的
   架构是权威**，config 与它不一致会直接报错（否则会记录一套配置却训练另一个网络）。
   续训还会比对 `performance` 的语义项（精度/注意力核/fused/compile），不一致时报错；
+  decoder 始终不编译，世界模型的 `compile_scope` 不会启用 decoder 编译。
   旧版本写的 checkpoint 没有该记录，视为参考策略。
 
 - 可选的目标关键帧磁盘缓存：`decoder_train.target_cache_dir`（默认空 = 关闭）。只保存每个

@@ -13,11 +13,31 @@
 | `precision` | `float32` | `float32` / `bfloat16` | 模型**计算**精度。bfloat16 通过 `torch.autocast` 生效；持久状态仍为 FP32，时钟仍为 float64，NLL/KL、投影与标准化、像素指标一律在 FP32 计算（见下） |
 | `anchor_attention` | `reference` | `reference` / `sdpa` | `reference` 走显式注意力并返回权重；`sdpa` 用 `scaled_dot_product_attention` 融合核（带学习到的空间偏置），**不返回权重**。读序列很短，SDPA 不保证更快 |
 | `fused_optimizer` | `false` | bool | 仅 CUDA：`torch.optim.AdamW(fused=True)`。CPU 上请求会直接报 `PerformanceError`，不会静默退回 |
-| `compile` | `false` | bool | 只编译 **predictor head** 这个纯函数（不是整个循环动力学，也不是解码器）。**是否可用取决于 torch 版本、编译后端与平台**：可用时会先跑一次真实执行（预检）并记为 `applied`+`verified`；后端不可用（例如缺少 C++ 工具链）会抛 `PerformanceError` 并提示关闭该开关 |
+| `compile` | `false` | bool | 启用所选范围的 torch.compile；是否可用取决于版本、工具链和后端。不编译 decoder，不引入手写 CUDA/Triton 核 |
+| `compile_scope` | `predictor` | `predictor` / `training_blocks` | 0.4.0 新增；前者保持原有 predictor head 编译，后者融合完整动力学子步循环、anchor 写入和 Gaussian NLL/KL 末维均值 |
+| `compile_fallback` | `false` | bool | 0.4.0 新增；允许预检失败时明确记录参考回退并警告；不允许启动后静默切换 |
 | `pin_memory` | `false` | bool | 仅 CUDA：主机侧 pinned 缓冲 + 非阻塞拷贝。数值与不固定时完全一致 |
 | `non_blocking` | `false` | bool | 同上，异步 H2D；CPU 上两项都无效果 |
 
 所有值在 `RunConfig.validate()` 阶段检查；未知值直接报错。
+
+### 训练块融合
+
+使用 `compile=true, compile_scope="training_blocks"`。模型参数与持久状态需为 FP32，BF16 通过
+`precision="bfloat16"` 开启。编译器必须支持 `emulate_precision_casts`，以保留 eager 的低精度
+中间舍入；不支持时预检会失败，参考路径仍支持原有 torch>=2.1 环境。
+
+安装四个普通可调用对象前，会在所选 AMP 策略下执行前向和反向并检查有限性；不消耗调用者
+RNG、不改训练模式或已有梯度、不改变检查点参数名。默认异常直接报错；只有显式
+`compile_fallback=true` 才会在设置阶段清除所有编译目标、发出警告并记录 `scope="none"`。
+后续新形状、FP32 验证或反向若遇到编译失败，会停止并提示关闭编译，不继续一个策略变化的训练步。
+
+采用研究中验证过的静态形状；不同批次大小、积分步数、精度、梯度模式和布局可能触发
+专门编译。支持公开 per-region 选项的新 torch 版本为每个目标使用独立缓存、最多 64 次重编译，
+旧版使用 torch 默认限制；不修改进程的全局编译配置。冷启动和重编译限制需纳入评估。
+融合不改变每个 horizon 的独立积分、时钟、mask、
+采样顺序或概率 FP32 契约。编译反向不提供二阶梯度；需要高阶梯度或显式 FP64 参数时使用
+`compile=false`。CPU 同样需要可用的本地编译后端，缺少工具链时可明确开启设置阶段回退。
 
 ### 数值契约（不会因为加速而改变）
 
@@ -40,8 +60,10 @@
 checkpoint 记录**实际生效**的策略（精度、注意力核、fused 是否真的启用、compile 状态、
 pin 是否真的生效）。续训时：
 
-- 语义项（precision / anchor_attention / fused / compile）不一致 → 报 `PerformanceError`；
+- 语义项（precision / anchor_attention / fused / compile / 生效 compile_scope）不一致 → 报 `PerformanceError`；
 - 旧 checkpoint 没有该记录 → 视为参考策略，只能以参考设置续训；
+- 0.3.0 已记录 `compile=true` 但没有 scope 的 checkpoint 按 `predictor` 解读；不允许切换到
+  `training_blocks` 后仍称为同一次续训。未编译的旧 checkpoint 对应 `scope="none"`；
 - 设备类型、pinned 传输、compile 的详细状态等元数据差异**不会**阻止续训（跨设备续训是
   合法工作流）。
 

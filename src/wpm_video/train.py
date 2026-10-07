@@ -180,7 +180,7 @@ def forward_window(model: VideoWorldModel, batch: dict, config: RunConfig, sampl
         target = model.project(entry["tokens"][index])
         # bits per dimension: mean over patches and dims, then summed over the batch,
         # with the squared error accumulated in float32 like every reported statistic
-        bits = gaussian_nll_bits(target, mu, logvar).mean(dim=(1, 2))
+        bits = model._nll(target, mu, logvar, reduction="batch")
         horizon_sum = bits.sum() if horizon_sum is None else horizon_sum + bits.sum()
         squared = (target.float() - mu.float()).detach().pow(2).mean(dim=(1, 2)).sum()
         squared_sum = squared if squared_sum is None else squared_sum + squared
@@ -191,8 +191,8 @@ def forward_window(model: VideoWorldModel, batch: dict, config: RunConfig, sampl
         squared_sum = torch.zeros((), device=batch["observed"].device, dtype=torch.float32)
     horizon_nll = horizon_sum / max(horizon_items, 1)
     present_mu, present_logvar = estimate_for(len(states) - 1)
-    present_bits = gaussian_nll_bits(model.project(batch["observed"][:, -1]), present_mu,
-                                     present_logvar).mean()
+    present_bits = model._nll(model.project(batch["observed"][:, -1]), present_mu,
+                              present_logvar, reduction="mean")
     prior_bits = torch.stack([record["prior_nll_bits_per_dim"] for record in diagnostics]).mean()
     kl_bits = torch.stack([record["kl_bits_per_dim"] for record in diagnostics]).mean()
     loss = (

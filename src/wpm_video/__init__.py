@@ -41,7 +41,7 @@ from .train import (build_model, evaluate_model, fit_projection, materialize_sta
                     rng_snapshot, set_determinism, source_signature, train)
 from .world_state import WorldState
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "__version__",

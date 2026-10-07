@@ -20,7 +20,7 @@
 # 1) 包外环境（可复用已有的 torch，避免重复下载）
 python -m venv --system-site-packages E:\work\wpm_env
 # 2) 安装发行包
-& "E:\work\wpm_env\Scripts\python.exe" -m pip install "E:\path\to\worldline_video_model-0.3.0-py3-none-any.whl"
+& "E:\work\wpm_env\Scripts\python.exe" -m pip install "E:\path\to\worldline_video_model-0.4.0-py3-none-any.whl"
 # 3) 校验（用解释器全路径，不依赖 PATH）
 & "E:\work\wpm_env\Scripts\python.exe" -m wpm_video --version
 ```
@@ -29,7 +29,7 @@ Linux / macOS：
 
 ```bash
 python -m venv --system-site-packages ~/wpm_env
-~/wpm_env/bin/python -m pip install "/path/to/worldline_video_model-0.3.0-py3-none-any.whl"
+~/wpm_env/bin/python -m pip install "/path/to/worldline_video_model-0.4.0-py3-none-any.whl"
 ~/wpm_env/bin/python -m wpm_video --version
 ```
 
@@ -37,7 +37,7 @@ python -m venv --system-site-packages ~/wpm_env
   （构建过程中源码目录里会出现构建中间产物）。
 - 只用 native 编码器（合成视频、CPU）时，上面的安装就够了。
 - 需要真实 V-JEPA 2 编码器时，再安装可选依赖：安装 wheel 时写成
-  `"E:\path\to\worldline_video_model-0.3.0-py3-none-any.whl[vjepa]"`，或单独执行
+  `"E:\path\to\worldline_video_model-0.4.0-py3-none-any.whl[vjepa]"`，或单独执行
   `pip install "transformers>=5.15,<6" huggingface_hub`。
 - 本页后续命令统一写作 `& $py -m wpm_video`，其中 `$py` 是解释器全路径
   （`&` 是 PowerShell 调用运算符，省略它无法执行变量里的命令）。激活环境后也可以用
@@ -172,7 +172,9 @@ $py = "E:\work\wpm_env\Scripts\python.exe"
   "precision": "bfloat16",
   "anchor_attention": "sdpa",
   "fused_optimizer": true,
-  "compile": false,
+  "compile": true,
+  "compile_scope": "training_blocks",
+  "compile_fallback": false,
   "pin_memory": true,
   "non_blocking": true
 }
@@ -183,14 +185,18 @@ $py = "E:\work\wpm_env\Scripts\python.exe"
 - `anchor_attention`：`sdpa` 用融合核（不返回注意力权重）；`predict` 的公开默认仍会返回
   真实权重，训练/验证/推理内部路径才使用配置的核。
 - `fused_optimizer`：仅 CUDA；在 CPU 上请求会直接报错，不会静默退回。
-- `compile`：只编译 predictor head，是否可用取决于 torch 版本/后端/平台；会先做一次真实
-  执行的预检，失败抛 `PerformanceError`。不依赖自定义 CUDA/Triton 算子。
+- `compile` / `compile_scope`：默认不编译；开启后默认范围仍是 `predictor`。0.4.0 新增
+  `training_blocks`，融合完整动力学循环、anchor 写入与 NLL/KL 末维均值。通过当前计算精度的
+  前向/反向预检后原子挂接，不改变 `state_dict`。需要支持低精度舍入保真的 torch 编译后端；
+  不同批次形状与积分步数会专门编译。不依赖手写 CUDA/Triton 算子，不编译 decoder。
+- `compile_fallback`：默认 `false`，预检失败报错；显式设为 `true` 时，预检失败发出警告并
+  在实际策略里记录参考回退。成功启动后出现的编译/反向失败仍会停止，不在训练中切换策略。
 - `pin_memory`/`non_blocking`：仅 CUDA 生效的传输选项，数值与不开启时完全一致。
 
 编码与解码器的数据路径同样可选加速：`encoder.batch_clips` 现在是**真实 batch**（native
 一次 `conv3d`，V-JEPA2 一次模型调用）；`decoder_train.target_cache_dir` 可缓存目标关键帧，
 命中时不再解码视频（但仍校验源文件哈希）。检查点记录实际生效的策略，续训拒绝精度/注意力
-核/fused/compile 的语义变化，忽略设备与 pinned 等元数据差异。
+核/fused/compile 及生效编译范围的语义变化，忽略设备与 pinned 等元数据差异。
 
 合成单步基准由 `examples/benchmark.py` 提供（结果只写到包外目录）：
 
@@ -251,6 +257,7 @@ images = decode_latents(decoder, {2.0: futures[2.0]["mu"]}, device)   # {2.0: (3
 - [docs/api.md](docs/api.md)：Python API 与张量形状、单位
 - [docs/decoder.md](docs/decoder.md)：可选 RGB 解码器的架构、训练、兼容性与已知限制
 - [docs/performance.md](docs/performance.md)：可选加速项、精度契约与基准测试方法
+- [docs/releases.md](docs/releases.md)：发行版本与兼容性说明
 - [examples/prepare_sample_dataset.md](examples/prepare_sample_dataset.md)：公开样例片段下载与来源校验
 
 ## 目录

@@ -268,14 +268,14 @@ config.performance = PerformanceConfig(precision="bfloat16", anchor_attention="s
 | `PerformanceConfig(...)` | 加速开关；默认全部是参考实现。字段与边界见 [performance.md](performance.md) |
 | `autocast_context(performance, device)` | `bfloat16` 时返回 autocast 上下文，否则 no-op；`device` 可传字符串或 `None` |
 | `build_optimizer(params, performance, lr, wd, device)` | AdamW；`fused_optimizer` 在非 CUDA 上抛 `PerformanceError`，不会静默退回 |
-| `apply_compile(model, performance, compile_fn=None)` | 只编译 predictor head（纯可调用对象，不改 `state_dict` 键），并跑一次预检证明能执行；返回状态记录（`disabled`/`applied`/`unverified`），失败抛 `PerformanceError` |
+| `apply_compile(model, performance, compile_fn=None)` | 编译 `compile_scope` 指定的普通可调用对象，不改 `state_dict`；`training_blocks` 做前向/反向预检并原子挂接。返回实际 scope、targets 和状态；显式允许设置阶段回退时为 `fallback`，否则失败抛 `PerformanceError` |
 | `to_device(tensor, device, performance=None)` | 按策略搬运（CUDA 上可选 pinned/非阻塞）；`performance=None` 即参考行为 |
 | `substeps_for(deltas, substep_seconds, max_substeps)` | 主机侧按与积分器相同的公式算步数 |
 | `materialize_stats(stats)` | 把 `forward_window(..., stats_mode="tensor")` 的统计量转成 float |
 
 数值契约：bfloat16 只作用于模型计算；持久状态 FP32、时钟 float64、NLL/KL 与投影标准化
 以及所有上报指标都在 FP32；冻结编码器 FP32。检查点记录实际生效的策略，续训拒绝语义项
-（精度/注意力核/fused/compile）变化，忽略设备与 pinned 等元数据差异。
+（精度/注意力核/fused/compile/生效编译范围）变化，忽略设备与 pinned 等元数据差异。
 
 ## 单位
 
